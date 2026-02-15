@@ -123,35 +123,48 @@ python arbitrage.py --ticker BTC --size 0.001 --max-position 0.01 \
 
 ## Production Deployment
 
-### 使用 screen 后台运行
+### 方式一: 启动脚本 + screen (推荐)
+
+项目提供了预配置的启动脚本，避免 screen 命令行引号嵌套问题：
 
 ```bash
-# 创建日志目录
-mkdir -p logs
+# 给脚本加执行权限 (首次)
+chmod +x scripts/*.sh
 
 # ===== BTC 套利 =====
-screen -dmS arb-btc bash -c '
+screen -dmS arb-btc ./scripts/start_btc.sh
+
+# ===== ETH 套利 =====
+screen -dmS arb-eth ./scripts/start_eth.sh
+
+# ===== 保守模式 (高阈值 + 小仓位) =====
+screen -dmS arb-safe ./scripts/start_safe.sh
+```
+
+脚本自动创建 `logs/` 目录并生成带时间戳的日志文件。
+
+### 方式二: 直接前台运行 + 日志
+
+```bash
+mkdir -p logs
+
+# BTC 标准模式
 python arbitrage.py --ticker BTC --size 0.001 --max-position 0.01 \
     --long-threshold 10 --short-threshold 10 \
     --warmup-samples 100 --fill-timeout 5 \
     2>&1 | tee -a logs/arb_BTC_$(date +%F_%H%M%S).log
-'
 
-# ===== ETH 套利 =====
-screen -dmS arb-eth bash -c '
+# ETH
 python arbitrage.py --ticker ETH --size 0.01 --max-position 0.1 \
     --long-threshold 5 --short-threshold 5 \
     --warmup-samples 50 --fill-timeout 3 \
     2>&1 | tee -a logs/arb_ETH_$(date +%F_%H%M%S).log
-'
 
-# ===== 保守模式 (高阈值 + 小仓位) =====
-screen -dmS arb-safe bash -c '
+# 保守试水
 python arbitrage.py --ticker BTC --size 0.0005 --max-position 0.005 \
     --long-threshold 20 --short-threshold 20 \
     --warmup-samples 200 --fill-timeout 3 \
     2>&1 | tee -a logs/arb_SAFE_$(date +%F_%H%M%S).log
-'
 ```
 
 ### screen 管理命令
@@ -166,16 +179,19 @@ screen -r arb-btc
 # 从 screen 中脱离 (不停止程序)
 # 按 Ctrl+A 然后按 D
 
-# 停止指定会话
+# 停止指定会话 (发送 Ctrl+C 触发优雅退出)
+screen -S arb-btc -p 0 -X stuff $'\003'
+
+# 强制终止会话
 screen -S arb-btc -X quit
 
 # 停止所有套利会话
 screen -ls | grep arb | awk '{print $1}' | xargs -I {} screen -S {} -X quit
 ```
 
-### 使用 systemd (Linux 服务)
+### 方式三: systemd 服务 (Linux 生产环境)
 
-```bash
+```ini
 # /etc/systemd/system/arb-btc.service
 [Unit]
 Description=01-Lighter BTC Arbitrage
@@ -188,6 +204,8 @@ WorkingDirectory=/path/to/01-lighter
 ExecStart=/usr/bin/python3 arbitrage.py --ticker BTC --size 0.001 --max-position 0.01 --long-threshold 10 --short-threshold 10
 Restart=on-failure
 RestartSec=30
+StandardOutput=append:/path/to/01-lighter/logs/arb-btc.log
+StandardError=append:/path/to/01-lighter/logs/arb-btc.log
 
 [Install]
 WantedBy=multi-user.target
@@ -263,9 +281,14 @@ sudo journalctl -u arb-btc -f  # 查看日志
 │   ├── spread_analyzer.py      # 价差采样与动态阈值
 │   └── data_logger.py          # CSV 数据记录
 │
-└── helpers/
-    ├── __init__.py
-    └── logger.py               # 统一日志 (控制台+文件)
+├── helpers/
+│   ├── __init__.py
+│   └── logger.py               # 统一日志 (控制台+文件)
+│
+└── scripts/                     # 启动脚本
+    ├── start_btc.sh            # BTC 标准模式
+    ├── start_eth.sh            # ETH 模式
+    └── start_safe.sh           # 保守模式
 ```
 
 ---

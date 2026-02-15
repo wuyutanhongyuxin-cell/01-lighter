@@ -172,7 +172,17 @@ class LighterClient(BaseExchangeClient):
         self._account_state = account
         if not self._account_ready.is_set():
             self._account_ready.set()
-            logger.info(f"Lighter 账户状态就绪 (account={account_id})")
+            # 首次收到账户数据时，输出键名用于调试
+            if isinstance(account, dict):
+                logger.info(
+                    f"Lighter 账户状态就绪 (account={account_id}), "
+                    f"keys={list(account.keys())}"
+                )
+            else:
+                logger.info(
+                    f"Lighter 账户状态就绪 (account={account_id}), "
+                    f"type={type(account).__name__}"
+                )
 
     async def start_websocket(self, market_indices: List[int]):
         """启动 WebSocket 订阅 (在后台运行)"""
@@ -456,25 +466,40 @@ class LighterClient(BaseExchangeClient):
         if isinstance(market_id, str):
             market_id = self.get_market_index(market_id)
 
-        # 优先从 WebSocket 账户状态获取
+        # 优先从 WebSocket 账户状态获取 (raw dict)
         if self._account_state:
-            positions = self._account_state.get("positions", [])
-            for pos in positions:
-                pos_market = pos.get("market_index", pos.get("market_id", -1))
-                if int(pos_market) == market_id:
-                    size = pos.get("size", pos.get("position", "0"))
-                    return Decimal(str(size))
+            positions = self._account_state.get("positions", {})
+            # positions 可能是 dict (keyed by market) 或 list
+            if isinstance(positions, dict):
+                for key, pos in positions.items():
+                    pos_market = pos.get("market_id", key)
+                    if int(pos_market) == market_id:
+                        position = Decimal(str(pos.get("position", "0")))
+                        sign = int(pos.get("sign", 1))
+                        return position if sign >= 0 else -position
+            elif isinstance(positions, list):
+                for pos in positions:
+                    pos_market = pos.get("market_id", pos.get("market_index", -1))
+                    if int(pos_market) == market_id:
+                        position = Decimal(str(pos.get("position", "0")))
+                        sign = int(pos.get("sign", 1))
+                        return position if sign >= 0 else -position
 
         # fallback: REST API
+        # account() 返回 DetailedAccounts, 需要 .accounts[0]
         try:
             account_api = lighter.AccountApi(self.api_client)
-            account = await account_api.account(
+            result = await account_api.account(
                 by="index", value=str(self.account_index)
             )
-            if hasattr(account, "positions"):
-                for pos in account.positions:
-                    if int(pos.market_index) == market_id:
-                        return Decimal(str(pos.size))
+            if hasattr(result, "accounts") and result.accounts:
+                acct = result.accounts[0]
+                if hasattr(acct, "positions"):
+                    for pos in acct.positions:
+                        if int(pos.market_id) == market_id:
+                            position = Decimal(str(pos.position))
+                            sign = int(pos.sign) if hasattr(pos, "sign") else 1
+                            return position if sign >= 0 else -position
         except Exception as e:
             logger.debug(f"Lighter 获取仓位失败: {e}")
 
@@ -482,22 +507,45 @@ class LighterClient(BaseExchangeClient):
 
     async def get_balance(self) -> Decimal:
         """获取 USDC 余额"""
-        # 从 WebSocket 账户状态
+        # 从 WebSocket 账户状态 (raw dict)
         if self._account_state:
-            balance = self._account_state.get("balance", self._account_state.get("collateral", "0"))
-            if balance:
-                return Decimal(str(balance))
+            # 尝试 available_balance / collateral
+            for key in ("available_balance", "collateral"):
+                val = self._account_state.get(key)
+                if val and str(val) != "0":
+                    return Decimal(str(val))
+            # 尝试 assets 中的 USDC
+            assets = self._account_state.get("assets", {})
+            if isinstance(assets, dict):
+                usdc = assets.get("USDC", {})
+                balance = usdc.get("balance")
+                if balance and str(balance) != "0":
+                    return Decimal(str(balance))
 
         # fallback: REST API
+        # account() 返回 DetailedAccounts, 需要 .accounts[0]
         try:
             account_api = lighter.AccountApi(self.api_client)
-            account = await account_api.account(
+            result = await account_api.account(
                 by="index", value=str(self.account_index)
             )
-            if hasattr(account, "balance"):
-                return Decimal(str(account.balance))
-            if hasattr(account, "collateral"):
-                return Decimal(str(account.collateral))
+            if hasattr(result, "accounts") and result.accounts:
+                acct = result.accounts[0]
+                # 优先用 available_balance
+                if hasattr(acct, "available_balance") and acct.available_balance:
+                    val = Decimal(str(acct.available_balance))
+                    if val > 0:
+                        return val
+                # 次选 collateral
+                if hasattr(acct, "collateral") and acct.collateral:
+                    val = Decimal(str(acct.collateral))
+                    if val > 0:
+                        return val
+                # 最后从 assets 数组中查找 USDC
+                if hasattr(acct, "assets"):
+                    for asset in acct.assets:
+                        if hasattr(asset, "symbol") and asset.symbol == "USDC":
+                            return Decimal(str(asset.balance))
         except Exception as e:
             logger.warning(f"Lighter 获取余额失败: {e}")
 

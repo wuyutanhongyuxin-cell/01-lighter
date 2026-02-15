@@ -257,6 +257,23 @@ class O1ExchangeClient(BaseExchangeClient):
     def get_size_decimals(self, market_id: int) -> int:
         return self._size_decimals.get(market_id, 4)
 
+    # ========== 服务器时间 ==========
+
+    async def get_server_time(self) -> int:
+        """获取服务器时间 (从 /info 端点, 参考 01test2)"""
+        try:
+            url = f"{self.api_url}/info"
+            async with self._http_session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    ts = data.get("timestamp", data.get("serverTime", 0))
+                    if ts:
+                        # API 可能返回毫秒或秒
+                        return ts if ts < 2_000_000_000 else ts // 1000
+        except Exception as e:
+            logger.debug(f"获取服务器时间失败, 使用本地时间: {e}")
+        return int(time.time())
+
     # ========== 签名 ==========
 
     def _user_sign(self, message: bytes) -> bytes:
@@ -336,11 +353,12 @@ class O1ExchangeClient(BaseExchangeClient):
     async def create_session(self):
         """创建交易 Session (每次生成新的临时 Keypair)"""
         self.session_keypair = Keypair()
-        expiry = int(time.time()) + SESSION_DURATION
+        server_time = await self.get_server_time()
+        expiry = server_time + SESSION_DURATION
 
         # 注意: CreateSession 是 Action 的嵌套消息
         action = schema_pb2.Action()
-        action.current_timestamp = int(time.time())
+        action.current_timestamp = server_time
         self._nonce_counter += 1
         action.nonce = self._nonce_counter
         action.create_session.CopyFrom(
@@ -423,6 +441,7 @@ class O1ExchangeClient(BaseExchangeClient):
         size: Decimal,
         order_type: str = "limit",
         reduce_only: bool = False,
+        _retry: bool = False,
     ) -> Dict[str, Any]:
         """
         在 01exchange 下单
@@ -434,6 +453,7 @@ class O1ExchangeClient(BaseExchangeClient):
             size: 数量 (Decimal)
             order_type: 'post_only' / 'immediate' / 'limit'
             reduce_only: 是否仅减仓
+            _retry: 内部参数, session 重建后的重试标记
         """
         await self.ensure_session()
 
@@ -458,9 +478,12 @@ class O1ExchangeClient(BaseExchangeClient):
         # Side 映射 (ASK=0, BID=1)
         proto_side = schema_pb2.BID if side == "buy" else schema_pb2.ASK
 
+        # 使用服务器时间 (参考 01test2)
+        server_time = await self.get_server_time()
+
         # PlaceOrder 是 Action 的嵌套消息
         action = schema_pb2.Action()
-        action.current_timestamp = int(time.time())
+        action.current_timestamp = server_time
         self._nonce_counter += 1
         action.nonce = self._nonce_counter
         place_order_msg = schema_pb2.Action.PlaceOrder(
@@ -485,8 +508,22 @@ class O1ExchangeClient(BaseExchangeClient):
 
         # 检查 Receipt 是否包含错误
         if receipt.HasField("err"):
-            error_msg = str(receipt.err)
-            raise RuntimeError(f"01 下单被拒绝: {error_msg}")
+            # 尝试获取可读错误名 (参考 01test2)
+            try:
+                error_name = schema_pb2.Error.Name(receipt.err)
+            except (ValueError, AttributeError):
+                error_name = str(receipt.err)
+
+            # Session 过期 → 自动重建并重试一次 (参考 01test2)
+            if "SESSION" in error_name.upper() and not _retry:
+                logger.warning(f"01 Session 过期 ({error_name}), 重新创建...")
+                self.session_id = None
+                await self.create_session()
+                return await self.place_order(
+                    market_id, side, price, size, order_type, reduce_only, _retry=True
+                )
+
+            raise RuntimeError(f"01 下单被拒绝: {error_name}")
 
         # PlaceOrderResult: posted 有 order_id, fills 有成交列表
         result = receipt.place_order_result
@@ -516,9 +553,11 @@ class O1ExchangeClient(BaseExchangeClient):
         if isinstance(market_id, str):
             market_id = self.get_market_id(market_id)
 
+        server_time = await self.get_server_time()
+
         # CancelOrderById 是 Action 的嵌套消息 (不是 CancelOrder)
         action = schema_pb2.Action()
-        action.current_timestamp = int(time.time())
+        action.current_timestamp = server_time
         self._nonce_counter += 1
         action.nonce = self._nonce_counter
         action.cancel_order_by_id.CopyFrom(
@@ -535,11 +574,14 @@ class O1ExchangeClient(BaseExchangeClient):
 
             # 检查 Receipt 是否包含错误
             if receipt.HasField("err"):
-                error_msg = str(receipt.err)
-                if "ORDER_NOT_FOUND" in error_msg or "not found" in error_msg.lower():
+                try:
+                    error_name = schema_pb2.Error.Name(receipt.err)
+                except (ValueError, AttributeError):
+                    error_name = str(receipt.err)
+                if "ORDER_NOT_FOUND" in error_name.upper() or "NOT_FOUND" in error_name.upper():
                     logger.info(f"01 撤单: order_id={order_id} 未找到 (可能已成交)")
                     return False
-                logger.warning(f"01 撤单错误: {error_msg}")
+                logger.warning(f"01 撤单错误: {error_name}")
                 return False
 
             logger.info(f"01 撤单成功: order_id={order_id}")
@@ -609,12 +651,13 @@ class O1ExchangeClient(BaseExchangeClient):
     # ========== 高层业务方法 ==========
 
     async def cancel_all_orders(self, market_id):
-        """取消所有活跃订单"""
+        """取消所有活跃订单 (本地跟踪 + API 查询双重取消)"""
         if isinstance(market_id, str):
             market_id = self.get_market_id(market_id)
 
+        # 1. 取消本地跟踪的订单
         active = list(self.order_tracker.active_orders.keys())
-        logger.info(f"取消所有挂单: 共 {len(active)} 笔")
+        logger.info(f"取消本地跟踪的挂单: 共 {len(active)} 笔")
 
         for oid in active:
             try:
@@ -627,40 +670,96 @@ class O1ExchangeClient(BaseExchangeClient):
             except Exception as e:
                 logger.warning(f"取消订单 #{oid} 异常: {e}")
 
-    async def close_position(self, market_id, current_position: Decimal):
-        """
-        市价平仓 (使用 IMMEDIATE_OR_CANCEL + reduce_only 概念)
+        # 2. 通过 API 查询真实订单并取消 (防止本地跟踪遗漏)
+        api_orders = await self._get_open_orders_from_api(market_id)
+        if api_orders:
+            logger.info(f"API 发现额外 {len(api_orders)} 笔挂单, 正在取消...")
+            for oid in api_orders:
+                try:
+                    await self.cancel_order(market_id, oid)
+                except Exception as e:
+                    logger.warning(f"取消 API 订单 #{oid} 异常: {e}")
 
-        01exchange 平仓用 IOC 模式
+    async def _get_open_orders_from_api(self, market_id: int) -> List[int]:
+        """通过 GET /account/{account_id}/orders 查询真实挂单"""
+        if self._account_id is None:
+            return []
+
+        try:
+            url = f"{self.api_url}/account/{self._account_id}/orders"
+            async with self._http_session.get(
+                url, timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                if resp.status != 200:
+                    logger.debug(f"查询01订单失败: {resp.status}")
+                    return []
+                data = await resp.json()
+
+            order_ids = []
+            orders = data if isinstance(data, list) else data.get("orders", [])
+            for order in orders:
+                oid = order.get("orderId", order.get("order_id", 0))
+                omid = order.get("marketId", order.get("market_id", -1))
+                if int(omid) == market_id and oid:
+                    order_ids.append(int(oid))
+            return order_ids
+        except Exception as e:
+            logger.debug(f"查询01真实订单异常: {e}")
+            return []
+
+    async def close_position(self, market_id, current_position: Decimal) -> bool:
+        """
+        市价平仓 (使用 IMMEDIATE_OR_CANCEL + reduce_only)
+        参考 01test2 的 _try_close_position 实现
+
+        Returns:
+            True = 平仓指令已提交成功, False = 提交失败
         """
         if current_position == 0:
-            return
+            return True
 
         if isinstance(market_id, str):
             market_id = self.get_market_id(market_id)
 
         # 获取当前价格
-        ob = await self.get_orderbook(market_id)
+        try:
+            ob = await self.get_orderbook(market_id)
+        except Exception as e:
+            logger.error(f"01 平仓: 获取订单簿失败: {e}")
+            return False
+
         bbo = self.get_bbo(ob)
 
         if current_position > 0:
             # 多头平仓 → 卖出 (价格打折确保 IOC 成交)
             side = "sell"
-            close_price = bbo["best_bid"] * Decimal("0.98") if bbo["best_bid"] else Decimal("0")
+            if not bbo["best_bid"]:
+                logger.error("01 平仓: 没有买单, 无法平仓")
+                return False
+            close_price = bbo["best_bid"] * Decimal("0.98")
         else:
             # 空头平仓 → 买入 (价格加价确保 IOC 成交)
             side = "buy"
-            close_price = bbo["best_ask"] * Decimal("1.02") if bbo["best_ask"] else Decimal("0")
+            if not bbo["best_ask"]:
+                logger.error("01 平仓: 没有卖单, 无法平仓")
+                return False
+            close_price = bbo["best_ask"] * Decimal("1.02")
 
-        logger.info(
-            f"01 平仓: {side} {abs(current_position)} @ {close_price} (IOC)"
+        logger.warning(
+            f"01 紧急平仓: {side} {abs(current_position)} @ {close_price} (IOC+reduce_only)"
         )
 
-        await self.place_order(
-            market_id=market_id,
-            side=side,
-            price=close_price,
-            size=abs(current_position),
-            order_type="immediate",
-            reduce_only=True,
-        )
+        try:
+            result = await self.place_order(
+                market_id=market_id,
+                side=side,
+                price=close_price,
+                size=abs(current_position),
+                order_type="immediate",
+                reduce_only=True,
+            )
+            logger.info(f"01 平仓订单已提交: order_id={result.get('order_id')}")
+            return True
+        except Exception as e:
+            logger.error(f"01 平仓订单提交失败: {e}")
+            return False

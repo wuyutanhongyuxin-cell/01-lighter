@@ -372,9 +372,9 @@ class ArbStrategy:
 
     async def shutdown(self):
         """
-        优雅退出:
-          1. 停止主循环
-          2. 取消所有挂单
+        优雅退出 (参考 01test2 的紧急平仓逻辑):
+          1. 强制刷新 01 Session (确保不过期)
+          2. 取消所有挂单 (本地 + API 双重保障)
           3. 平仓两端
           4. 断开连接
         """
@@ -384,24 +384,39 @@ class ArbStrategy:
 
         self._stop_flag = True
 
-        # 1. 取消所有01挂单
+        # 0. 强制重建 01 Session (shutdown 时 session 可能已过期!)
+        try:
+            logger.info("强制重建 01 Session (确保平仓不会因 session 过期失败)...")
+            await asyncio.wait_for(self.o1.create_session(), timeout=10)
+            logger.info("01 Session 重建成功")
+        except Exception as e:
+            logger.warning(f"01 Session 重建失败: {e} (将尝试使用现有 session)")
+
+        # 1. 取消所有01挂单 (本地跟踪 + API 查询双重取消)
         try:
             logger.info("取消 01exchange 所有挂单...")
-            await self.o1.cancel_all_orders(self.o1_market_id)
+            await asyncio.wait_for(
+                self.o1.cancel_all_orders(self.o1_market_id), timeout=15
+            )
         except Exception as e:
             logger.warning(f"取消01挂单失败: {e}")
 
         # 2. 取消所有 Lighter 挂单
         try:
             logger.info("取消 Lighter 所有挂单...")
-            await self.lighter.cancel_all_orders(self.lighter_market_id)
+            await asyncio.wait_for(
+                self.lighter.cancel_all_orders(self.lighter_market_id), timeout=15
+            )
         except Exception as e:
             logger.warning(f"取消 Lighter 挂单失败: {e}")
 
-        # 3. 平仓两端
+        # 3. 等待一下让取消生效
+        await asyncio.sleep(1)
+
+        # 4. 平仓两端
         await self._close_all_positions()
 
-        # 4. 断开连接
+        # 5. 断开连接
         try:
             await self.lighter.disconnect()
         except Exception as e:
@@ -412,10 +427,10 @@ class ArbStrategy:
         except Exception as e:
             logger.warning(f"断开 01exchange 失败: {e}")
 
-        # 5. 关闭日志
+        # 6. 关闭日志
         self.data_logger.close()
 
-        # 6. Telegram 停止通知
+        # 7. Telegram 停止通知
         if self.tg:
             pos_stats = self.positions.get_stats()
             runtime = (time.time() - self._start_time) / 3600 if self._start_time else 0
@@ -426,12 +441,21 @@ class ArbStrategy:
         logger.info("退出完成!")
 
     async def _close_all_positions(self):
-        """平仓两端所有仓位 (查询交易所真实仓位, 不依赖本地跟踪)"""
+        """
+        平仓两端所有仓位 (参考 01test2 的 _emergency_close_all + _try_close_position)
+
+        关键改进:
+        - 查询交易所真实仓位, 不依赖本地跟踪
+        - 每次重试前重新获取订单簿价格
+        - 记录每步结果, 便于排查
+        """
         max_retries = 3
         min_size = self.order_quantity / 10
 
         for attempt in range(max_retries):
-            # 查询两端真实仓位 (各带 10 秒超时)
+            logger.info(f"--- 平仓尝试 {attempt + 1}/{max_retries} ---")
+
+            # 查询两端真实仓位
             o1_pos = self.positions.o1_position
             lighter_pos = self.positions.lighter_position
 
@@ -439,56 +463,56 @@ class ArbStrategy:
                 o1_pos = await asyncio.wait_for(
                     self.o1.get_position(self.o1_market_id), timeout=10
                 )
-                logger.info(f"01 真实仓位查询: {o1_pos}")
+                logger.info(f"01 真实仓位: {o1_pos}")
             except Exception as e:
-                logger.warning(f"查询01真实仓位失败 (用本地值 {o1_pos}): {e}")
+                logger.warning(f"查询01真实仓位失败, 用本地值 {o1_pos}: {e}")
 
             try:
                 lighter_pos = await asyncio.wait_for(
                     self.lighter.get_position(self.lighter_market_id), timeout=10
                 )
-                logger.info(f"Lighter 真实仓位查询: {lighter_pos}")
+                logger.info(f"Lighter 真实仓位: {lighter_pos}")
             except Exception as e:
-                logger.warning(f"查询Lighter真实仓位失败 (用本地值 {lighter_pos}): {e}")
+                logger.warning(f"查询Lighter真实仓位失败, 用本地值 {lighter_pos}: {e}")
 
             if abs(o1_pos) < min_size and abs(lighter_pos) < min_size:
                 logger.info(f"两端仓位已清空 (01={o1_pos}, Lighter={lighter_pos})")
                 return
 
-            logger.info(
-                f"平仓中 (尝试 {attempt + 1}/{max_retries}): "
-                f"01={o1_pos}, Lighter={lighter_pos}"
-            )
-
-            # 平仓01端 (带 15 秒超时)
+            # 平仓01端
             if abs(o1_pos) >= min_size:
                 try:
-                    await asyncio.wait_for(
+                    success = await asyncio.wait_for(
                         self.o1.close_position(self.o1_market_id, o1_pos),
                         timeout=15,
                     )
-                    logger.info(f"01 平仓指令已发送: {o1_pos}")
+                    if success:
+                        logger.info(f"01 平仓指令提交成功: 平 {o1_pos}")
+                    else:
+                        logger.error(f"01 平仓指令提交返回失败")
                 except asyncio.TimeoutError:
-                    logger.error(f"01 平仓超时 (15s)")
+                    logger.error("01 平仓超时 (15s)")
                 except Exception as e:
-                    logger.error(f"01 平仓失败: {e}")
+                    logger.error(f"01 平仓异常: {e}", exc_info=True)
 
-            # 平仓 Lighter 端 (带 15 秒超时)
+            # 平仓 Lighter 端
             if abs(lighter_pos) >= min_size:
                 try:
                     await asyncio.wait_for(
                         self.lighter.close_position(self.lighter_market_id, lighter_pos),
                         timeout=15,
                     )
-                    logger.info(f"Lighter 平仓指令已发送: {lighter_pos}")
+                    logger.info(f"Lighter 平仓指令已发送: 平 {lighter_pos}")
                 except asyncio.TimeoutError:
-                    logger.error(f"Lighter 平仓超时 (15s)")
+                    logger.error("Lighter 平仓超时 (15s)")
                 except Exception as e:
-                    logger.error(f"Lighter 平仓失败: {e}")
+                    logger.error(f"Lighter 平仓异常: {e}", exc_info=True)
 
-            await asyncio.sleep(2)
+            # 等待 IOC 订单被交易所处理
+            await asyncio.sleep(3)
 
         # 最终确认
+        logger.info("--- 最终仓位确认 ---")
         try:
             final_o1 = await asyncio.wait_for(
                 self.o1.get_position(self.o1_market_id), timeout=10

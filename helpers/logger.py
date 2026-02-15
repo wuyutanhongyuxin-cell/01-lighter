@@ -1,4 +1,5 @@
 import logging
+import os
 import sys
 from datetime import datetime
 
@@ -24,8 +25,10 @@ def setup_logger(name: str = "arbitrage", level: str = "INFO") -> logging.Logger
     console_handler.setFormatter(fmt)
     logger.addHandler(console_handler)
 
-    # 文件输出
-    log_filename = f"arbitrage_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    # 文件输出 → logs/ 目录
+    log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_filename = os.path.join(log_dir, f"arbitrage_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
     file_handler = logging.FileHandler(log_filename, encoding="utf-8")
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(fmt)

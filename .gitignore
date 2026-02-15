@@ -26,6 +26,7 @@ schema_pb2.py
 logs/
 
 # Data files
+data/
 *.csv
 
 # IDE

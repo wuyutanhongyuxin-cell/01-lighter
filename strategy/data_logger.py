@@ -17,8 +17,11 @@ logger = logging.getLogger("arbitrage.data")
 class DataLogger:
     """CSV 数据记录"""
 
-    def __init__(self, log_dir: str = "."):
+    def __init__(self, log_dir: str = None):
+        if log_dir is None:
+            log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
         self.log_dir = log_dir
+        os.makedirs(log_dir, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         # 价差采样日志

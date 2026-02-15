@@ -1,0 +1,7 @@
+aiohttp>=3.9.0
+python-dotenv>=1.0.0
+protobuf>=4.25.0
+solders>=0.20.0
+lighter-sdk>=0.1.0
+websockets>=12.0
+tenacity>=8.2.0

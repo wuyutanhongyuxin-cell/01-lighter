@@ -244,7 +244,7 @@ class ArbStrategy:
         lighter_ask: Decimal,
     ):
         """处理套利信号"""
-        success = False
+        result = None
 
         if signal == "long_01":
             if not self.positions.can_long_o1():
@@ -253,7 +253,7 @@ class ArbStrategy:
             logger.info(
                 f"触发 long_01: lighter_bid={lighter_bid} > o1_ask={o1_ask}"
             )
-            success = await self.order_mgr.execute_long_o1(o1_ask, lighter_bid)
+            result = await self.order_mgr.execute_long_o1(o1_ask, lighter_bid)
 
         elif signal == "short_01":
             if not self.positions.can_short_o1():
@@ -262,27 +262,21 @@ class ArbStrategy:
             logger.info(
                 f"触发 short_01: o1_bid={o1_bid} > lighter_ask={lighter_ask}"
             )
-            success = await self.order_mgr.execute_short_o1(o1_bid, lighter_ask)
+            result = await self.order_mgr.execute_short_o1(o1_bid, lighter_ask)
 
-        # 交易成功 → Telegram 通知
-        if success and self.tg:
-            pos = self.positions.get_stats()
-            if signal == "long_01":
-                o1_side, lighter_side = "buy", "sell"
-                o1_price = o1_ask - self.o1_tick_size
-                lighter_price = lighter_bid
-            else:
-                o1_side, lighter_side = "sell", "buy"
-                o1_price = o1_bid + self.o1_tick_size
-                lighter_price = lighter_ask
-            spread = abs(lighter_price - o1_price)
+        # 交易成功 → Telegram 通知 (使用实际成交数据)
+        if result and self.tg:
             await self.tg.notify_trade(
-                direction=signal,
-                o1_side=o1_side, o1_price=o1_price, o1_size=self.order_quantity,
-                lighter_side=lighter_side, lighter_price=lighter_price, lighter_size=self.order_quantity,
-                spread_captured=spread,
-                o1_position=pos["o1_position"],
-                lighter_position=pos["lighter_position"],
+                direction=result["direction"],
+                o1_side=result["o1_side"],
+                o1_price=result["o1_price"],
+                o1_size=result["size"],
+                lighter_side=result["lighter_side"],
+                lighter_price=result["lighter_price"],
+                lighter_size=result["size"],
+                spread_captured=result["spread"],
+                o1_position=result["o1_position"],
+                lighter_position=result["lighter_position"],
             )
 
     async def _check_balances(self):

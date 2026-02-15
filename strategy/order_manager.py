@@ -59,7 +59,7 @@ class OrderManager:
         self,
         o1_ask: Decimal,
         lighter_bid: Decimal,
-    ) -> bool:
+    ) -> Optional[dict]:
         """
         执行做多01套利:
           1. 01 Post-Only BUY (ask - tick_size, 确保是 Maker)
@@ -67,8 +67,8 @@ class OrderManager:
           3. 01成交 → Lighter SELL Taker
 
         Returns:
-            True = 完整套利成功
-            False = 未成交或失败
+            dict = 交易详情 (成功)
+            None = 未成交或失败
         """
         if self._executing:
             logger.warning("上一笔套利尚未完成, 跳过")
@@ -89,7 +89,7 @@ class OrderManager:
         self,
         o1_bid: Decimal,
         lighter_ask: Decimal,
-    ) -> bool:
+    ) -> Optional[dict]:
         """
         执行做空01套利:
           1. 01 Post-Only SELL (bid + tick_size, 确保是 Maker)
@@ -117,7 +117,7 @@ class OrderManager:
         o1_side: str,
         o1_price: Decimal,
         lighter_side: str,
-    ) -> bool:
+    ) -> Optional[dict]:
         """
         核心套利执行流程
 
@@ -145,14 +145,14 @@ class OrderManager:
             )
         except Exception as e:
             logger.error(f"01 下单失败: {e}")
-            return False
+            return None
 
         # ===== Phase 2: 等待01成交 (轮询检测) =====
         filled = await self._wait_for_o1_fill(order_id)
 
         if not filled:
             logger.info(f"01 订单 #{order_id} 超时未成交, 已撤单")
-            return False
+            return None
 
         logger.info(f"01 订单 #{order_id} 已成交! 立即对冲...")
 
@@ -172,7 +172,7 @@ class OrderManager:
             )
             # 即使 Lighter 失败, 也要更新01端仓位
             self.positions.update_o1(o1_side, self.order_quantity)
-            return False
+            return None
 
         # ===== 成功: 更新仓位和日志 =====
         self.positions.record_arb_trade(direction, self.order_quantity)
@@ -200,7 +200,17 @@ class OrderManager:
             f"=== 套利完成: {direction} | 价差={spread} | "
             f"01={o1_side}@{o1_price} Lighter={lighter_side}@{lighter_price} ==="
         )
-        return True
+        return {
+            "direction": direction,
+            "o1_side": o1_side,
+            "o1_price": o1_price,
+            "lighter_side": lighter_side,
+            "lighter_price": lighter_price,
+            "size": self.order_quantity,
+            "spread": spread,
+            "o1_position": self.positions.o1_position,
+            "lighter_position": self.positions.lighter_position,
+        }
 
     async def _wait_for_o1_fill(self, order_id: int) -> bool:
         """

@@ -6,6 +6,7 @@ Telegram Bot 通知模块
 """
 
 import logging
+from decimal import Decimal
 import aiohttp
 
 logger = logging.getLogger("arbitrage.telegram")
@@ -74,13 +75,17 @@ class TelegramNotifier:
         spread_captured,
         o1_position, lighter_position,
     ):
-        """交易完成通知"""
+        """交易完成通知 (含利润预估)"""
         dir_label = "做多01" if direction == "long_01" else "做空01"
+        # 利润预估 = 价差 * 数量 (Lighter零费率, 01 Maker低费率忽略)
+        profit_est = Decimal(str(spread_captured)) * Decimal(str(o1_size))
+        profit_sign = "+" if profit_est >= 0 else ""
         text = (
             f"🔔 *交易执行: {dir_label}*\n"
             f"01: {o1_side.upper()}@{o1_price} x{o1_size}\n"
             f"Lighter: {lighter_side.upper()}@{lighter_price} x{lighter_size}\n"
             f"价差: {spread_captured}\n"
+            f"💵 预估利润: {profit_sign}{profit_est:.4f} USDC\n"
             f"仓位: 01={o1_position} Lighter={lighter_position}"
         )
         await self.send_message(text)

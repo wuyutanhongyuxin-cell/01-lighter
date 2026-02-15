@@ -159,6 +159,9 @@ class O1ExchangeClient(BaseExchangeClient):
         self._price_decimals: Dict[int, int] = {}
         self._size_decimals: Dict[int, int] = {}
 
+        # 账户信息
+        self._account_id: Optional[int] = None
+
         # HTTP session
         self._http_session: Optional[aiohttp.ClientSession] = None
 
@@ -168,11 +171,12 @@ class O1ExchangeClient(BaseExchangeClient):
     # ========== 连接管理 ==========
 
     async def connect(self):
-        """初始化连接: 创建 HTTP session + 加载市场信息 + 创建交易 Session"""
+        """初始化连接: 创建 HTTP session + 加载市场信息 + 查询账户 + 创建交易 Session"""
         self._http_session = aiohttp.ClientSession()
         logger.info(f"01exchange 连接中... 钱包: {self.pubkey[:8]}...")
 
         await self._load_markets()
+        await self._resolve_account_id()
         await self.create_session()
 
         self._connected = True
@@ -189,18 +193,20 @@ class O1ExchangeClient(BaseExchangeClient):
     # ========== 市场信息 ==========
 
     async def _load_markets(self):
-        """加载市场信息 (精度、market_id 等)"""
-        url = f"{self.api_url}/markets"
+        """加载市场信息 (精度、market_id 等) — 使用 GET /info"""
+        url = f"{self.api_url}/info"
         async with self._http_session.get(url) as resp:
             if resp.status != 200:
                 raise RuntimeError(f"获取市场信息失败: {resp.status}")
             data = await resp.json()
 
-        for market in data:
+        markets = data.get("markets", data) if isinstance(data, dict) else data
+
+        for market in markets:
             symbol = market.get("symbol", "")
-            market_id = market.get("marketId", market.get("market_id", 0))
+            market_id = market.get("marketId", 0)
             price_dec = market.get("priceDecimals", 1)
-            size_dec = market.get("sizeDecimals", 4)
+            size_dec = market.get("sizeDecimals", 5)
 
             self._markets[symbol] = market
             self._market_id_map[symbol] = market_id
@@ -214,10 +220,28 @@ class O1ExchangeClient(BaseExchangeClient):
 
         logger.info(f"已加载 {len(self._markets)} 个市场")
 
+    async def _resolve_account_id(self):
+        """通过 GET /user/{pubkey} 获取 account_id"""
+        url = f"{self.api_url}/user/{self.pubkey}"
+        try:
+            async with self._http_session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    account_ids = data.get("accountIds", [])
+                    if account_ids:
+                        self._account_id = account_ids[0]
+                        logger.info(f"01 账户 ID: {self._account_id}")
+                    else:
+                        logger.warning("01 未找到关联账户, 将使用本地跟踪")
+                else:
+                    logger.warning(f"查询01账户失败: {resp.status}")
+        except Exception as e:
+            logger.warning(f"查询01账户异常: {e}")
+
     def get_market_id(self, ticker: str) -> int:
         """根据 ticker 获取 market_id"""
-        # 尝试不同格式
-        for key in [ticker, f"{ticker}-PERP", f"{ticker}_PERP", f"{ticker}/USD"]:
+        # 尝试不同格式: BTC -> BTCUSD, BTC-PERP, etc.
+        for key in [ticker, f"{ticker}USD", f"{ticker}-PERP", f"{ticker}_PERP", f"{ticker}/USD"]:
             if key in self._market_id_map:
                 return self._market_id_map[key]
         raise ValueError(
@@ -344,7 +368,12 @@ class O1ExchangeClient(BaseExchangeClient):
     # ========== 订单簿 ==========
 
     async def get_orderbook(self, market_id) -> Dict[str, Any]:
-        """获取订单簿 REST API"""
+        """
+        获取订单簿 — GET /market/{market_id}/orderbook
+
+        API 返回格式: {"asks": [[price, size], ...], "bids": [[price, size], ...]}
+        价格和数量已是人类可读的 double, 不需要除以精度因子。
+        """
         if isinstance(market_id, str):
             market_id = self.get_market_id(market_id)
 
@@ -354,21 +383,20 @@ class O1ExchangeClient(BaseExchangeClient):
                 raise RuntimeError(f"获取订单簿失败: {resp.status}")
             data = await resp.json()
 
-        price_dec = self.get_price_decimals(market_id)
-        size_dec = self.get_size_decimals(market_id)
-
-        # 将整数价格/数量转回浮点 (供策略使用)
+        # API 直接返回 [price, size] double 数组, 无需转换
         bids = []
-        for bid in data.get("bids", []):
-            p = float(bid["price"]) / (10 ** price_dec) if isinstance(bid, dict) else float(bid[0]) / (10 ** price_dec)
-            s = float(bid["size"]) / (10 ** size_dec) if isinstance(bid, dict) else float(bid[1]) / (10 ** size_dec)
-            bids.append([p, s])
+        for entry in data.get("bids", []):
+            if isinstance(entry, (list, tuple)):
+                bids.append([float(entry[0]), float(entry[1])])
+            elif isinstance(entry, dict):
+                bids.append([float(entry["price"]), float(entry["size"])])
 
         asks = []
-        for ask in data.get("asks", []):
-            p = float(ask["price"]) / (10 ** price_dec) if isinstance(ask, dict) else float(ask[0]) / (10 ** price_dec)
-            s = float(ask["size"]) / (10 ** size_dec) if isinstance(ask, dict) else float(ask[1]) / (10 ** size_dec)
-            asks.append([p, s])
+        for entry in data.get("asks", []):
+            if isinstance(entry, (list, tuple)):
+                asks.append([float(entry[0]), float(entry[1])])
+            elif isinstance(entry, dict):
+                asks.append([float(entry["price"]), float(entry["size"])])
 
         return {"bids": bids, "asks": asks}
 
@@ -484,44 +512,56 @@ class O1ExchangeClient(BaseExchangeClient):
 
     # ========== 仓位与余额 ==========
 
-    async def get_position(self, market_id) -> Decimal:
-        """
-        获取持仓 (01 没有持仓查询 API, 通过本地跟踪计算)
+    async def _get_account_data(self) -> Optional[Dict]:
+        """获取完整账户数据 — GET /account/{account_id}"""
+        if self._account_id is None:
+            return None
 
-        注意: 这是一个近似值, 真正的仓位需要查询链上数据
-        """
-        # 01 可能有 /account 类 REST endpoint
+        try:
+            url = f"{self.api_url}/account/{self._account_id}"
+            async with self._http_session.get(url) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                else:
+                    logger.debug(f"获取01账户数据失败: {resp.status}")
+        except Exception as e:
+            logger.debug(f"获取01账户数据异常: {e}")
+
+        return None
+
+    async def get_position(self, market_id) -> Decimal:
+        """获取持仓 — 从 GET /account/{account_id} 提取"""
         if isinstance(market_id, str):
             market_id = self.get_market_id(market_id)
 
-        try:
-            url = f"{self.api_url}/account/{self.pubkey}"
-            async with self._http_session.get(url) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    # 尝试从返回数据中提取仓位
-                    positions = data.get("positions", [])
-                    for pos in positions:
-                        if pos.get("market_id") == market_id or pos.get("marketId") == market_id:
-                            size_dec = self.get_size_decimals(market_id)
-                            raw_size = pos.get("size", 0)
-                            return Decimal(str(raw_size)) / Decimal(10 ** size_dec)
-        except Exception as e:
-            logger.debug(f"获取01仓位失败 (将使用本地跟踪): {e}")
+        data = await self._get_account_data()
+        if data:
+            positions = data.get("positions", [])
+            for pos in positions:
+                pos_market = pos.get("marketId", pos.get("market_id", -1))
+                if int(pos_market) == market_id:
+                    # 仓位数据已是人类可读格式
+                    size = pos.get("size", pos.get("netSize", 0))
+                    return Decimal(str(size))
 
         return Decimal("0")
 
     async def get_balance(self) -> Decimal:
-        """获取 USDC 余额"""
-        try:
-            url = f"{self.api_url}/account/{self.pubkey}"
-            async with self._http_session.get(url) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    balance = data.get("balance", data.get("collateral", 0))
-                    return Decimal(str(balance))
-        except Exception as e:
-            logger.warning(f"获取01余额失败: {e}")
+        """获取 USDC 余额 — 从 GET /account/{account_id} 提取"""
+        data = await self._get_account_data()
+        if data:
+            # 从 balances 数组提取
+            balances = data.get("balances", [])
+            for bal in balances:
+                if bal.get("tokenId", 0) == 0:  # USDC tokenId=0
+                    return Decimal(str(bal.get("balance", bal.get("amount", 0))))
+
+            # 或者从 margins 提取
+            margins = data.get("margins", {})
+            if margins:
+                equity = margins.get("equity", margins.get("accountValue", 0))
+                if equity:
+                    return Decimal(str(equity))
 
         return Decimal("0")
 

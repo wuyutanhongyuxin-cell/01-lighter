@@ -92,15 +92,27 @@ class TelegramNotifier:
 
     async def notify_heartbeat(
         self, runtime_hours: float, total_trades: int,
-        diff_long, diff_short, avg_long, avg_short,
+        diff_long, diff_short,
+        long_trigger, short_trigger,
         o1_position, lighter_position, net_position,
     ):
         """心跳状态推送"""
+        long_gap = long_trigger - diff_long
+        short_gap = short_trigger - diff_short
+        long_status = "🟢" if long_gap <= 0 else "⏳"
+        short_status = "🟢" if short_gap <= 0 else "⏳"
+
         text = (
             f"💓 *心跳* | 运行 {runtime_hours:.1f}h | 交易 {total_trades} 笔\n"
-            f"📊 做多价差: {diff_long:.2f} (均值: {avg_long:.2f})\n"
-            f"📊 做空价差: {diff_short:.2f} (均值: {avg_short:.2f})\n"
-            f"💰 01: {o1_position} | Lighter: {lighter_position} | 净: {net_position}"
+            f"\n📈 *做多价差*\n"
+            f"  当前: ${diff_long:.2f}\n"
+            f"  触发线: ${long_trigger:.2f}\n"
+            f"  还差: ${long_gap:.2f} {long_status}\n"
+            f"\n📉 *做空价差*\n"
+            f"  当前: ${diff_short:.2f}\n"
+            f"  触发线: ${short_trigger:.2f}\n"
+            f"  还差: ${short_gap:.2f} {short_status}\n"
+            f"\n💰 01: {o1_position} | Lighter: {lighter_position} | 净: {net_position}"
         )
         await self.send_message(text)
 

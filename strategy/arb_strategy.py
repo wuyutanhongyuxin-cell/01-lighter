@@ -326,17 +326,29 @@ class ArbStrategy:
         runtime_hours = (time.time() - self._start_time) / 3600
         total_trades = pos_stats["total_long"] + pos_stats["total_short"]
 
+        # 计算有效触发线 = max(avg + threshold, min_spread)
+        long_trigger = max(
+            spread_stats["avg_long"] + spread_stats["long_threshold"],
+            float(self.spread.min_spread),
+        )
+        short_trigger = max(
+            spread_stats["avg_short"] + spread_stats["short_threshold"],
+            float(self.spread.min_spread),
+        )
+        long_gap = long_trigger - spread_stats["diff_long"]
+        short_gap = short_trigger - spread_stats["diff_short"]
+
         logger.info("=" * 60)
         logger.info(
             f"💓 心跳 | 运行 {runtime_hours:.1f}h | 交易 {total_trades} 笔"
         )
         logger.info(
-            f"📊 做多价差: {spread_stats['diff_long']:.2f} "
-            f"(均值: {spread_stats['avg_long']:.2f})"
+            f"📈 做多: 当前={spread_stats['diff_long']:.2f} "
+            f"触发线={long_trigger:.2f} 还差={long_gap:.2f}"
         )
         logger.info(
-            f"📊 做空价差: {spread_stats['diff_short']:.2f} "
-            f"(均值: {spread_stats['avg_short']:.2f})"
+            f"📉 做空: 当前={spread_stats['diff_short']:.2f} "
+            f"触发线={short_trigger:.2f} 还差={short_gap:.2f}"
         )
         logger.info(
             f"💰 01: {pos_stats['o1_position']} | "
@@ -349,10 +361,10 @@ class ArbStrategy:
             await self.tg.notify_heartbeat(
                 runtime_hours=runtime_hours,
                 total_trades=total_trades,
-                diff_long=float(spread_stats["diff_long"]),
-                diff_short=float(spread_stats["diff_short"]),
-                avg_long=float(spread_stats["avg_long"]),
-                avg_short=float(spread_stats["avg_short"]),
+                diff_long=spread_stats["diff_long"],
+                diff_short=spread_stats["diff_short"],
+                long_trigger=long_trigger,
+                short_trigger=short_trigger,
                 o1_position=pos_stats["o1_position"],
                 lighter_position=pos_stats["lighter_position"],
                 net_position=pos_stats["net_position"],

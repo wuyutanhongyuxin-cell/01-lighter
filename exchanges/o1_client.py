@@ -335,11 +335,15 @@ class O1ExchangeClient(BaseExchangeClient):
         self.session_keypair = Keypair()
         expiry = int(time.time()) + SESSION_DURATION
 
+        # 注意: CreateSession 是 Action 的嵌套消息
         action = schema_pb2.Action()
+        action.current_timestamp = int(time.time())
         action.create_session.CopyFrom(
-            schema_pb2.CreateSession(
-                session_key=bytes(self.session_keypair.pubkey()),
+            schema_pb2.Action.CreateSession(
+                user_pubkey=bytes(self.keypair.pubkey()),
+                session_pubkey=bytes(self.session_keypair.pubkey()),
                 expiry_timestamp=expiry,
+                signature_framing=schema_pb2.Action.HEX,
             )
         )
 
@@ -434,25 +438,28 @@ class O1ExchangeClient(BaseExchangeClient):
         raw_price = int(float(price) * (10 ** price_dec))
         raw_size = int(float(size) * (10 ** size_dec))
 
-        # fill_mode 映射
+        # FillMode 映射 (LIMIT=0, POST_ONLY=1, IOC=2, FOK=3)
         if order_type == "post_only":
-            proto_fill_mode = schema_pb2.FillMode.POST_ONLY
+            proto_fill_mode = schema_pb2.POST_ONLY
         elif order_type == "immediate":
-            proto_fill_mode = schema_pb2.FillMode.IMMEDIATE_OR_CANCEL
+            proto_fill_mode = schema_pb2.IMMEDIATE_OR_CANCEL
         else:
-            proto_fill_mode = schema_pb2.FillMode.POST_ONLY
+            proto_fill_mode = schema_pb2.POST_ONLY
 
-        # Side 映射
-        proto_side = schema_pb2.Side.BID if side == "buy" else schema_pb2.Side.ASK
+        # Side 映射 (ASK=0, BID=1)
+        proto_side = schema_pb2.BID if side == "buy" else schema_pb2.ASK
 
+        # PlaceOrder 是 Action 的嵌套消息
         action = schema_pb2.Action()
-        place_order_msg = schema_pb2.PlaceOrder(
+        action.current_timestamp = int(time.time())
+        place_order_msg = schema_pb2.Action.PlaceOrder(
             session_id=self.session_id,
-            market=market_id,
+            market_id=market_id,
             side=proto_side,
             price=raw_price,
             size=raw_size,
             fill_mode=proto_fill_mode,
+            is_reduce_only=reduce_only,
         )
         action.place_order.CopyFrom(place_order_msg)
 
@@ -465,14 +472,18 @@ class O1ExchangeClient(BaseExchangeClient):
             action, self.session_keypair, self._session_sign
         )
 
-        order_id = receipt.place_order_result.order_id
-        logger.info(f"01 下单成功: order_id={order_id}")
+        # PlaceOrderResult: posted 有 order_id, fills 有成交列表
+        result = receipt.place_order_result
+        order_id = result.posted.order_id if result.HasField("posted") else 0
+        fills_count = len(result.fills)
+        logger.info(f"01 下单成功: order_id={order_id}, fills={fills_count}")
 
         return {
             "order_id": order_id,
             "side": side,
             "price": price,
             "size": size,
+            "fills": fills_count,
             "receipt": receipt,
         }
 
@@ -489,11 +500,12 @@ class O1ExchangeClient(BaseExchangeClient):
         if isinstance(market_id, str):
             market_id = self.get_market_id(market_id)
 
+        # CancelOrderById 是 Action 的嵌套消息 (不是 CancelOrder)
         action = schema_pb2.Action()
-        action.cancel_order.CopyFrom(
-            schema_pb2.CancelOrder(
+        action.current_timestamp = int(time.time())
+        action.cancel_order_by_id.CopyFrom(
+            schema_pb2.Action.CancelOrderById(
                 session_id=self.session_id,
-                market=market_id,
                 order_id=order_id,
             )
         )

@@ -126,25 +126,29 @@ TG_CHAT_ID=987654321               # 从 @userinfobot 获取
 python arbitrage.py --ticker BTC --size 0.001 --max-position 0.01 \
     --long-threshold 10 --short-threshold 10 \
     --warmup-samples 100 --fill-timeout 5 \
-    --tick-size 1
+    --tick-size 1 \
+    2>&1 | tee -a logs/run_BTC_$(date +%F_%H%M%S).log
 
 # BTC 保守试水 (小仓位 + 高阈值)
 python arbitrage.py --ticker BTC --size 0.0005 --max-position 0.005 \
     --long-threshold 20 --short-threshold 20 \
     --warmup-samples 200 --fill-timeout 3 \
-    --tick-size 1
+    --tick-size 1 \
+    2>&1 | tee -a logs/run_BTC_SAFE_$(date +%F_%H%M%S).log
 
 # ETH 标准模式
 python arbitrage.py --ticker ETH --size 0.01 --max-position 0.1 \
     --long-threshold 5 --short-threshold 5 \
     --warmup-samples 50 --fill-timeout 5 \
-    --tick-size 0.1
+    --tick-size 0.1 \
+    2>&1 | tee -a logs/run_ETH_$(date +%F_%H%M%S).log
 
 # SOL 标准模式
 python arbitrage.py --ticker SOL --size 0.1 --max-position 1.0 \
     --long-threshold 0.5 --short-threshold 0.5 \
     --warmup-samples 100 --fill-timeout 5 \
-    --tick-size 0.01
+    --tick-size 0.01 \
+    2>&1 | tee -a logs/run_SOL_$(date +%F_%H%M%S).log
 ```
 
 ---
@@ -179,19 +183,19 @@ mkdir -p logs
 # BTC 标准模式
 python arbitrage.py --ticker BTC --size 0.001 --max-position 0.01 \
     --long-threshold 10 --short-threshold 10 \
-    --warmup-samples 100 --fill-timeout 5 \
+    --warmup-samples 100 --fill-timeout 5 --tick-size 1 \
     2>&1 | tee -a logs/arb_BTC_$(date +%F_%H%M%S).log
 
 # ETH
 python arbitrage.py --ticker ETH --size 0.01 --max-position 0.1 \
     --long-threshold 5 --short-threshold 5 \
-    --warmup-samples 50 --fill-timeout 3 \
+    --warmup-samples 50 --fill-timeout 3 --tick-size 0.1 \
     2>&1 | tee -a logs/arb_ETH_$(date +%F_%H%M%S).log
 
 # 保守试水
 python arbitrage.py --ticker BTC --size 0.0005 --max-position 0.005 \
     --long-threshold 20 --short-threshold 20 \
-    --warmup-samples 200 --fill-timeout 3 \
+    --warmup-samples 200 --fill-timeout 3 --tick-size 1 \
     2>&1 | tee -a logs/arb_SAFE_$(date +%F_%H%M%S).log
 ```
 

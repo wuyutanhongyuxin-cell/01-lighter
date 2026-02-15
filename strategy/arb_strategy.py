@@ -17,6 +17,7 @@ from typing import Optional
 
 from exchanges.o1_client import O1ExchangeClient
 from exchanges.lighter_client import LighterClient
+from helpers.telegram import TelegramNotifier
 from strategy.order_book_manager import OrderBookManager
 from strategy.order_manager import OrderManager
 from strategy.position_tracker import PositionTracker
@@ -29,6 +30,8 @@ logger = logging.getLogger("arbitrage.strategy")
 BALANCE_CHECK_INTERVAL = 10
 # 最低余额阈值 (USDC)
 MIN_BALANCE = Decimal("10")
+# 心跳间隔 (秒)
+HEARTBEAT_INTERVAL = 300
 
 
 class ArbStrategy:
@@ -46,10 +49,12 @@ class ArbStrategy:
         fill_timeout: int = 5,
         warmup_samples: int = 100,
         o1_tick_size: Decimal = Decimal("10"),
+        telegram: TelegramNotifier = None,
     ):
         self.o1 = o1_client
         self.lighter = lighter_client
         self.ticker = ticker
+        self.tg = telegram
 
         # 市场 ID (连接后初始化)
         self.o1_market_id: Optional[int] = None
@@ -74,7 +79,10 @@ class ArbStrategy:
 
         # 运行状态
         self._stop_flag = False
+        self._stop_reason = "未知"
         self._last_balance_check: float = 0
+        self._last_heartbeat: float = 0
+        self._start_time: float = 0
 
     async def initialize(self):
         """
@@ -130,11 +138,23 @@ class ArbStrategy:
             f"warmup={self.spread.warmup_samples}"
         )
 
+        # Telegram 启动通知
+        if self.tg:
+            await self.tg.notify_start(
+                ticker=self.ticker,
+                qty=self.order_quantity,
+                max_pos=self.positions.max_position,
+                long_thresh=self.spread.long_threshold,
+                short_thresh=self.spread.short_threshold,
+            )
+
     async def run(self):
         """主循环"""
         logger.info("启动主循环...")
         logger.info(f"预热阶段: 需采集 {self.spread.warmup_samples} 个价差样本")
 
+        self._start_time = time.time()
+        self._last_heartbeat = time.time()
         loop_count = 0
 
         while not self._stop_flag:
@@ -184,6 +204,12 @@ class ArbStrategy:
         if loop_count % 30 == 0:
             self._log_status(stats)
 
+        # 4.5 心跳推送 (每 5 分钟)
+        now = time.time()
+        if now - self._last_heartbeat >= HEARTBEAT_INTERVAL:
+            self._last_heartbeat = now
+            await self._send_heartbeat(stats)
+
         # 5. 预热检查
         if not self.spread.is_warmed_up:
             if loop_count % 10 == 0:
@@ -215,6 +241,8 @@ class ArbStrategy:
         lighter_ask: Decimal,
     ):
         """处理套利信号"""
+        success = False
+
         if signal == "long_01":
             if not self.positions.can_long_o1():
                 logger.info("01 多头仓位已满, 跳过 long_01")
@@ -222,7 +250,7 @@ class ArbStrategy:
             logger.info(
                 f"触发 long_01: lighter_bid={lighter_bid} > o1_ask={o1_ask}"
             )
-            await self.order_mgr.execute_long_o1(o1_ask, lighter_bid)
+            success = await self.order_mgr.execute_long_o1(o1_ask, lighter_bid)
 
         elif signal == "short_01":
             if not self.positions.can_short_o1():
@@ -231,7 +259,28 @@ class ArbStrategy:
             logger.info(
                 f"触发 short_01: o1_bid={o1_bid} > lighter_ask={lighter_ask}"
             )
-            await self.order_mgr.execute_short_o1(o1_bid, lighter_ask)
+            success = await self.order_mgr.execute_short_o1(o1_bid, lighter_ask)
+
+        # 交易成功 → Telegram 通知
+        if success and self.tg:
+            pos = self.positions.get_stats()
+            if signal == "long_01":
+                o1_side, lighter_side = "buy", "sell"
+                o1_price = o1_ask - self.o1_tick_size
+                lighter_price = lighter_bid
+            else:
+                o1_side, lighter_side = "sell", "buy"
+                o1_price = o1_bid + self.o1_tick_size
+                lighter_price = lighter_ask
+            spread = abs(lighter_price - o1_price)
+            await self.tg.notify_trade(
+                direction=signal,
+                o1_side=o1_side, o1_price=o1_price, o1_size=self.order_quantity,
+                lighter_side=lighter_side, lighter_price=lighter_price, lighter_size=self.order_quantity,
+                spread_captured=spread,
+                o1_position=pos["o1_position"],
+                lighter_position=pos["lighter_position"],
+            )
 
     async def _check_balances(self):
         """定期检查两端余额"""
@@ -250,6 +299,7 @@ class ArbStrategy:
                     f"余额不足! 01={o1_balance}, Lighter={lighter_balance} "
                     f"(最低={MIN_BALANCE})"
                 )
+                self._stop_reason = f"余额不足 (01={o1_balance}, Lighter={lighter_balance})"
                 self._stop_flag = True
         except Exception as e:
             logger.warning(f"余额检查失败: {e}")
@@ -272,6 +322,44 @@ class ArbStrategy:
             f"trades: L={pos_stats['total_long']} S={pos_stats['total_short']} | "
             f"age: 01={staleness['o1_age']:.1f}s L={staleness['lighter_age']:.1f}s"
         )
+
+    async def _send_heartbeat(self, spread_stats: dict):
+        """心跳: 日志 + Telegram"""
+        pos_stats = self.positions.get_stats()
+        runtime_hours = (time.time() - self._start_time) / 3600
+        total_trades = pos_stats["total_long"] + pos_stats["total_short"]
+
+        logger.info("=" * 60)
+        logger.info(
+            f"💓 心跳 | 运行 {runtime_hours:.1f}h | 交易 {total_trades} 笔"
+        )
+        logger.info(
+            f"📊 做多价差: {spread_stats['diff_long']:.2f} "
+            f"(均值: {spread_stats['avg_long']:.2f})"
+        )
+        logger.info(
+            f"📊 做空价差: {spread_stats['diff_short']:.2f} "
+            f"(均值: {spread_stats['avg_short']:.2f})"
+        )
+        logger.info(
+            f"💰 01: {pos_stats['o1_position']} | "
+            f"Lighter: {pos_stats['lighter_position']} | "
+            f"净: {pos_stats['net_position']}"
+        )
+        logger.info("=" * 60)
+
+        if self.tg:
+            await self.tg.notify_heartbeat(
+                runtime_hours=runtime_hours,
+                total_trades=total_trades,
+                diff_long=float(spread_stats["diff_long"]),
+                diff_short=float(spread_stats["diff_short"]),
+                avg_long=float(spread_stats["avg_long"]),
+                avg_short=float(spread_stats["avg_short"]),
+                o1_position=pos_stats["o1_position"],
+                lighter_position=pos_stats["lighter_position"],
+                net_position=pos_stats["net_position"],
+            )
 
     async def shutdown(self):
         """
@@ -318,6 +406,14 @@ class ArbStrategy:
         # 5. 关闭日志
         self.data_logger.close()
 
+        # 6. Telegram 停止通知
+        if self.tg:
+            pos_stats = self.positions.get_stats()
+            runtime = (time.time() - self._start_time) / 3600 if self._start_time else 0
+            total = pos_stats["total_long"] + pos_stats["total_short"]
+            await self.tg.notify_stop(self._stop_reason, runtime, total)
+            await self.tg.close()
+
         logger.info("退出完成!")
 
     async def _close_all_positions(self):
@@ -359,7 +455,8 @@ class ArbStrategy:
 
         logger.warning("平仓未完全成功, 请手动检查仓位!")
 
-    def request_stop(self):
+    def request_stop(self, reason: str = "用户中断"):
         """请求停止 (由信号处理器调用)"""
-        logger.info("收到停止请求")
+        logger.info(f"收到停止请求: {reason}")
+        self._stop_reason = reason
         self._stop_flag = True

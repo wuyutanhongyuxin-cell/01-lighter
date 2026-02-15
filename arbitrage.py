@@ -21,6 +21,7 @@ from exchanges.o1_client import O1ExchangeClient
 from exchanges.lighter_client import LighterClient
 from strategy.arb_strategy import ArbStrategy
 from helpers.logger import setup_logger
+from helpers.telegram import TelegramNotifier
 
 
 def parse_args():
@@ -95,6 +96,12 @@ async def main():
     lighter_api_key_index = int(os.getenv("LIGHTER_API_KEY_INDEX", "3"))
     api_url = os.getenv("API_URL", "https://zo-mainnet.n1.xyz")
 
+    # Telegram 通知 (可选)
+    tg = TelegramNotifier(
+        bot_token=os.getenv("TG_BOT_TOKEN", ""),
+        chat_id=os.getenv("TG_CHAT_ID", ""),
+    )
+
     # 创建交易所客户端
     o1_client = O1ExchangeClient(
         private_key=solana_key,
@@ -119,6 +126,7 @@ async def main():
         fill_timeout=args.fill_timeout,
         warmup_samples=args.warmup_samples,
         o1_tick_size=args.tick_size,
+        telegram=tg,
     )
 
     # 注册信号处理 (优雅退出)

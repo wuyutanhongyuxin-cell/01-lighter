@@ -116,10 +116,10 @@ class SpreadAnalyzer:
         return {
             "sample_count": self._sample_count,
             "warmed_up": self._warmed_up,
-            "diff_long": float(self._last_diff_long) if self._last_diff_long else None,
-            "diff_short": float(self._last_diff_short) if self._last_diff_short else None,
-            "avg_long": float(self._avg_long) if self._avg_long else None,
-            "avg_short": float(self._avg_short) if self._avg_short else None,
+            "diff_long": float(self._last_diff_long) if self._last_diff_long is not None else 0.0,
+            "diff_short": float(self._last_diff_short) if self._last_diff_short is not None else 0.0,
+            "avg_long": float(self._avg_long) if self._avg_long is not None else 0.0,
+            "avg_short": float(self._avg_short) if self._avg_short is not None else 0.0,
             "long_threshold": float(self.long_threshold),
             "short_threshold": float(self.short_threshold),
         }

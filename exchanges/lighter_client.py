@@ -434,19 +434,20 @@ class LighterClient(BaseExchangeClient):
         logger.info(f"Lighter 撤单成功: order_index={order_id}")
         return True
 
-    async def cancel_all_orders(self, market_id):
-        """取消该市场所有挂单"""
-        if isinstance(market_id, str):
-            market_id = self.get_market_index(market_id)
+    async def cancel_all_orders(self, market_id=None):
+        """取消所有挂单 (SDK 不支持按市场取消, 会取消全部)"""
+        try:
+            tx, tx_hash, error = await self.signer_client.cancel_all_orders(
+                time_in_force=self.signer_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
+                timestamp_ms=int(time.time() * 1000) + 60000,
+            )
 
-        tx, tx_hash, error = await self.signer_client.cancel_all_orders(
-            market_index=market_id,
-        )
-
-        if error:
-            logger.warning(f"Lighter 批量撤单失败: {error}")
-        else:
-            logger.info(f"Lighter 批量撤单成功: market={market_id}")
+            if error:
+                logger.warning(f"Lighter 批量撤单失败: {error}")
+            else:
+                logger.info(f"Lighter 批量撤单成功")
+        except Exception as e:
+            logger.warning(f"Lighter 批量撤单异常: {e}")
 
     # ========== 仓位与余额 ==========
 

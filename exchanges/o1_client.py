@@ -165,6 +165,9 @@ class O1ExchangeClient(BaseExchangeClient):
         # HTTP session
         self._http_session: Optional[aiohttp.ClientSession] = None
 
+        # Action nonce 计数器
+        self._nonce_counter = 0
+
         # 订单跟踪
         self.order_tracker = O1OrderTracker()
 
@@ -338,6 +341,8 @@ class O1ExchangeClient(BaseExchangeClient):
         # 注意: CreateSession 是 Action 的嵌套消息
         action = schema_pb2.Action()
         action.current_timestamp = int(time.time())
+        self._nonce_counter += 1
+        action.nonce = self._nonce_counter
         action.create_session.CopyFrom(
             schema_pb2.Action.CreateSession(
                 user_pubkey=bytes(self.keypair.pubkey()),
@@ -349,6 +354,10 @@ class O1ExchangeClient(BaseExchangeClient):
 
         logger.info("创建 01exchange Session...")
         receipt = await self._execute_action(action, self.keypair, self._user_sign)
+
+        # 检查 Receipt 错误
+        if receipt.HasField("err"):
+            raise RuntimeError(f"创建 Session 失败: {receipt.err}")
 
         self.session_id = receipt.create_session_result.session_id
         self.session_created_at = time.time()  # 用本地时间!
@@ -452,6 +461,8 @@ class O1ExchangeClient(BaseExchangeClient):
         # PlaceOrder 是 Action 的嵌套消息
         action = schema_pb2.Action()
         action.current_timestamp = int(time.time())
+        self._nonce_counter += 1
+        action.nonce = self._nonce_counter
         place_order_msg = schema_pb2.Action.PlaceOrder(
             session_id=self.session_id,
             market_id=market_id,
@@ -471,6 +482,11 @@ class O1ExchangeClient(BaseExchangeClient):
         receipt = await self._execute_action(
             action, self.session_keypair, self._session_sign
         )
+
+        # 检查 Receipt 是否包含错误
+        if receipt.HasField("err"):
+            error_msg = str(receipt.err)
+            raise RuntimeError(f"01 下单被拒绝: {error_msg}")
 
         # PlaceOrderResult: posted 有 order_id, fills 有成交列表
         result = receipt.place_order_result
@@ -503,6 +519,8 @@ class O1ExchangeClient(BaseExchangeClient):
         # CancelOrderById 是 Action 的嵌套消息 (不是 CancelOrder)
         action = schema_pb2.Action()
         action.current_timestamp = int(time.time())
+        self._nonce_counter += 1
+        action.nonce = self._nonce_counter
         action.cancel_order_by_id.CopyFrom(
             schema_pb2.Action.CancelOrderById(
                 session_id=self.session_id,
@@ -514,10 +532,21 @@ class O1ExchangeClient(BaseExchangeClient):
             receipt = await self._execute_action(
                 action, self.session_keypair, self._session_sign
             )
+
+            # 检查 Receipt 是否包含错误
+            if receipt.HasField("err"):
+                error_msg = str(receipt.err)
+                if "ORDER_NOT_FOUND" in error_msg or "not found" in error_msg.lower():
+                    logger.info(f"01 撤单: order_id={order_id} 未找到 (可能已成交)")
+                    return False
+                logger.warning(f"01 撤单错误: {error_msg}")
+                return False
+
             logger.info(f"01 撤单成功: order_id={order_id}")
             return True
         except Exception as e:
-            if "ORDER_NOT_FOUND" in str(e):
+            error_str = str(e)
+            if "ORDER_NOT_FOUND" in error_str or "not found" in error_str.lower():
                 logger.info(f"01 撤单: order_id={order_id} 未找到 (可能已成交)")
                 return False
             raise

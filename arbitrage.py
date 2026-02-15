@@ -151,7 +151,16 @@ async def main():
     except Exception as e:
         logger.error(f"致命错误: {e}", exc_info=True)
     finally:
-        await strategy.shutdown()
+        # 屏蔽后续 Ctrl+C, 确保 shutdown 不被打断
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        logger.info("正在执行 shutdown, 请勿重复按 Ctrl+C...")
+        try:
+            await asyncio.wait_for(strategy.shutdown(), timeout=60)
+        except asyncio.TimeoutError:
+            logger.error("shutdown 超时 (60s), 请手动检查仓位!")
+        except Exception as e:
+            logger.error(f"shutdown 异常: {e}", exc_info=True)
 
 
 if __name__ == "__main__":

@@ -415,24 +415,29 @@ class ArbStrategy:
 
     async def _close_all_positions(self):
         """平仓两端所有仓位 (查询交易所真实仓位, 不依赖本地跟踪)"""
-        max_retries = 5
+        max_retries = 3
         min_size = self.order_quantity / 10
 
         for attempt in range(max_retries):
-            # 查询两端真实仓位
-            o1_pos = Decimal("0")
-            lighter_pos = Decimal("0")
-            try:
-                o1_pos = await self.o1.get_position(self.o1_market_id)
-            except Exception as e:
-                logger.warning(f"查询01真实仓位失败: {e}")
-                o1_pos = self.positions.o1_position  # fallback 本地值
+            # 查询两端真实仓位 (各带 10 秒超时)
+            o1_pos = self.positions.o1_position
+            lighter_pos = self.positions.lighter_position
 
             try:
-                lighter_pos = await self.lighter.get_position(self.lighter_market_id)
+                o1_pos = await asyncio.wait_for(
+                    self.o1.get_position(self.o1_market_id), timeout=10
+                )
+                logger.info(f"01 真实仓位查询: {o1_pos}")
             except Exception as e:
-                logger.warning(f"查询Lighter真实仓位失败: {e}")
-                lighter_pos = self.positions.lighter_position  # fallback 本地值
+                logger.warning(f"查询01真实仓位失败 (用本地值 {o1_pos}): {e}")
+
+            try:
+                lighter_pos = await asyncio.wait_for(
+                    self.lighter.get_position(self.lighter_market_id), timeout=10
+                )
+                logger.info(f"Lighter 真实仓位查询: {lighter_pos}")
+            except Exception as e:
+                logger.warning(f"查询Lighter真实仓位失败 (用本地值 {lighter_pos}): {e}")
 
             if abs(o1_pos) < min_size and abs(lighter_pos) < min_size:
                 logger.info(f"两端仓位已清空 (01={o1_pos}, Lighter={lighter_pos})")
@@ -440,44 +445,58 @@ class ArbStrategy:
 
             logger.info(
                 f"平仓中 (尝试 {attempt + 1}/{max_retries}): "
-                f"01 真实仓位={o1_pos}, Lighter 真实仓位={lighter_pos}"
+                f"01={o1_pos}, Lighter={lighter_pos}"
             )
 
-            # 平仓01端
+            # 平仓01端 (带 15 秒超时)
             if abs(o1_pos) >= min_size:
                 try:
-                    await self.o1.close_position(self.o1_market_id, o1_pos)
-                    self.positions.o1_position = Decimal("0")
-                    logger.info(f"01 平仓成功: {o1_pos}")
+                    await asyncio.wait_for(
+                        self.o1.close_position(self.o1_market_id, o1_pos),
+                        timeout=15,
+                    )
+                    logger.info(f"01 平仓指令已发送: {o1_pos}")
+                except asyncio.TimeoutError:
+                    logger.error(f"01 平仓超时 (15s)")
                 except Exception as e:
-                    logger.warning(f"01平仓失败: {e}")
+                    logger.error(f"01 平仓失败: {e}")
 
-            # 平仓 Lighter 端
+            # 平仓 Lighter 端 (带 15 秒超时)
             if abs(lighter_pos) >= min_size:
                 try:
-                    await self.lighter.close_position(
-                        self.lighter_market_id, lighter_pos
+                    await asyncio.wait_for(
+                        self.lighter.close_position(self.lighter_market_id, lighter_pos),
+                        timeout=15,
                     )
-                    self.positions.lighter_position = Decimal("0")
-                    logger.info(f"Lighter 平仓成功: {lighter_pos}")
+                    logger.info(f"Lighter 平仓指令已发送: {lighter_pos}")
+                except asyncio.TimeoutError:
+                    logger.error(f"Lighter 平仓超时 (15s)")
                 except Exception as e:
-                    logger.warning(f"Lighter平仓失败: {e}")
+                    logger.error(f"Lighter 平仓失败: {e}")
 
             await asyncio.sleep(2)
 
         # 最终确认
         try:
-            final_o1 = await self.o1.get_position(self.o1_market_id)
-            final_lighter = await self.lighter.get_position(self.lighter_market_id)
+            final_o1 = await asyncio.wait_for(
+                self.o1.get_position(self.o1_market_id), timeout=10
+            )
+            final_lighter = await asyncio.wait_for(
+                self.lighter.get_position(self.lighter_market_id), timeout=10
+            )
             if abs(final_o1) >= min_size or abs(final_lighter) >= min_size:
                 logger.error(
-                    f"平仓未完全成功! 01={final_o1}, Lighter={final_lighter} "
-                    f"请手动检查仓位!"
+                    f"!!! 平仓未完全成功 !!! 01={final_o1}, Lighter={final_lighter} "
+                    f"请立即手动检查仓位!"
                 )
+                if self.tg:
+                    await self.tg.send_message(
+                        f"⚠️ *平仓未完成*\n01: {final_o1}\nLighter: {final_lighter}\n请手动处理!"
+                    )
             else:
-                logger.info("最终确认: 两端仓位已清空")
+                logger.info(f"最终确认: 两端仓位已清空 (01={final_o1}, Lighter={final_lighter})")
         except Exception as e:
-            logger.warning(f"最终仓位确认失败: {e}, 请手动检查!")
+            logger.error(f"最终仓位确认失败: {e}, 请手动检查!")
 
     def request_stop(self, reason: str = "用户中断"):
         """请求停止 (由信号处理器调用)"""

@@ -644,14 +644,13 @@ class O1ExchangeClient(BaseExchangeClient):
         bbo = self.get_bbo(ob)
 
         if current_position > 0:
-            # 多头平仓 → 卖出
+            # 多头平仓 → 卖出 (价格打折确保 IOC 成交)
             side = "sell"
-            # 用一个较低的价格确保成交
-            close_price = bbo["best_bid"] * Decimal("0.995") if bbo["best_bid"] else Decimal("0")
+            close_price = bbo["best_bid"] * Decimal("0.98") if bbo["best_bid"] else Decimal("0")
         else:
-            # 空头平仓 → 买入
+            # 空头平仓 → 买入 (价格加价确保 IOC 成交)
             side = "buy"
-            close_price = bbo["best_ask"] * Decimal("1.005") if bbo["best_ask"] else Decimal("0")
+            close_price = bbo["best_ask"] * Decimal("1.02") if bbo["best_ask"] else Decimal("0")
 
         logger.info(
             f"01 平仓: {side} {abs(current_position)} @ {close_price} (IOC)"

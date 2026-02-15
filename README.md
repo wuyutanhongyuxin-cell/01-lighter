@@ -107,16 +107,44 @@ LIGHTER_API_KEY_INDEX=3
 
 > **安全提示**: `.env` 已在 `.gitignore` 中，永远不要将私钥提交到版本控制。
 
-### 4. 运行
+### 4. 配置 Telegram 通知 (可选)
+
+在 `.env` 中添加:
+
+```env
+# Telegram 通知 (不配置则自动禁用)
+TG_BOT_TOKEN=123456:ABC-DEF...    # 从 @BotFather 获取
+TG_CHAT_ID=987654321               # 从 @userinfobot 获取
+```
+
+配置后会推送: 启动/停止通知、交易执行通知、每 5 分钟心跳状态。
+
+### 5. 运行
 
 ```bash
-# 基础运行
-python arbitrage.py --size 0.001 --max-position 0.01
-
-# 自定义参数运行
+# BTC 标准模式 (推荐首次使用)
 python arbitrage.py --ticker BTC --size 0.001 --max-position 0.01 \
     --long-threshold 10 --short-threshold 10 \
-    --warmup-samples 100 --fill-timeout 5
+    --warmup-samples 100 --fill-timeout 5 \
+    --tick-size 1
+
+# BTC 保守试水 (小仓位 + 高阈值)
+python arbitrage.py --ticker BTC --size 0.0005 --max-position 0.005 \
+    --long-threshold 20 --short-threshold 20 \
+    --warmup-samples 200 --fill-timeout 3 \
+    --tick-size 1
+
+# ETH 标准模式
+python arbitrage.py --ticker ETH --size 0.01 --max-position 0.1 \
+    --long-threshold 5 --short-threshold 5 \
+    --warmup-samples 50 --fill-timeout 5 \
+    --tick-size 0.1
+
+# SOL 标准模式
+python arbitrage.py --ticker SOL --size 0.1 --max-position 1.0 \
+    --long-threshold 0.5 --short-threshold 0.5 \
+    --warmup-samples 100 --fill-timeout 5 \
+    --tick-size 0.01
 ```
 
 ---
@@ -236,11 +264,11 @@ sudo journalctl -u arb-btc -f  # 查看日志
 
 ### 参数调优建议
 
-| 场景 | size | max-position | threshold | warmup | fill-timeout |
-|------|------|-------------|-----------|--------|-------------|
-| **保守试水** | 0.0005 | 0.005 | 20 | 200 | 3 |
-| **标准运行** | 0.001 | 0.01 | 10 | 100 | 5 |
-| **激进模式** | 0.002 | 0.02 | 5 | 50 | 8 |
+| 场景 | size | max-position | threshold | warmup | fill-timeout | tick-size |
+|------|------|-------------|-----------|--------|-------------|-----------|
+| **保守试水** | 0.0005 | 0.005 | 20 | 200 | 3 | 1 |
+| **标准运行** | 0.001 | 0.01 | 10 | 100 | 5 | 1 |
+| **激进模式** | 0.002 | 0.02 | 5 | 50 | 8 | 1 |
 
 ---
 
@@ -283,7 +311,8 @@ sudo journalctl -u arb-btc -f  # 查看日志
 │
 ├── helpers/
 │   ├── __init__.py
-│   └── logger.py               # 统一日志 (控制台+文件)
+│   ├── logger.py               # 统一日志 (控制台+文件→logs/)
+│   └── telegram.py             # Telegram Bot 通知 (心跳+交易+启停)
 │
 └── scripts/                     # 启动脚本
     ├── start_btc.sh            # BTC 标准模式
@@ -343,18 +372,20 @@ sudo journalctl -u arb-btc -f  # 查看日志
 | **余额监控** | 每 10s 检查，任一端 < 10 USDC → 触发平仓退出 |
 | **优雅退出** | Ctrl+C → 取消挂单 → 市价平仓 → 断开连接 |
 | **数据日志** | 每笔采样和交易记录到 CSV，支持事后分析 |
+| **心跳监控** | 每 5 分钟推送运行状态到日志和 Telegram |
+| **Telegram 通知** | 交易执行、启动/停止、心跳状态实时推送 |
 
 ---
 
 ## Output Files
 
-运行后自动生成以下文件:
+运行后自动生成以下文件 (目录自动创建):
 
 | 文件 | 说明 |
 |------|------|
-| `spreads_YYYYMMDD_HHMMSS.csv` | 每秒价差采样 (两端BBO、diff、avg、signal) |
-| `trades_YYYYMMDD_HHMMSS.csv` | 每笔套利交易 (方向、价格、数量、捕获价差) |
-| `arbitrage_YYYYMMDD_HHMMSS.log` | 完整运行日志 |
+| `logs/arbitrage_YYYYMMDD_HHMMSS.log` | 完整运行日志 |
+| `data/spreads_YYYYMMDD_HHMMSS.csv` | 每秒价差采样 (两端BBO、diff、avg、signal) |
+| `data/trades_YYYYMMDD_HHMMSS.csv` | 每笔套利交易 (方向、价格、数量、捕获价差) |
 | `schema.proto` / `schema_pb2.py` | 01exchange Protobuf (首次运行自动下载编译) |
 
 ---

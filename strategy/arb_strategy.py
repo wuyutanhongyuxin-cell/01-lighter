@@ -44,6 +44,7 @@ class ArbStrategy:
         ticker: str = "BTC",
         order_quantity: Decimal = Decimal("0.001"),
         max_position: Decimal = Decimal("0.01"),
+        min_spread: Decimal = Decimal("0"),
         long_threshold: Decimal = Decimal("10"),
         short_threshold: Decimal = Decimal("10"),
         fill_timeout: int = 5,
@@ -66,6 +67,7 @@ class ArbStrategy:
             warmup_samples=warmup_samples,
             long_threshold=long_threshold,
             short_threshold=short_threshold,
+            min_spread=min_spread,
         )
         self.data_logger = DataLogger()
 
@@ -132,6 +134,7 @@ class ArbStrategy:
         logger.info(
             f"参数: ticker={self.ticker}, qty={self.order_quantity}, "
             f"max_pos={self.positions.max_position}, "
+            f"min_spread={self.spread.min_spread}, "
             f"long_thresh={self.spread.long_threshold}, "
             f"short_thresh={self.spread.short_threshold}, "
             f"fill_timeout={self.fill_timeout}s, "

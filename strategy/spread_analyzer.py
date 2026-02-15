@@ -22,11 +22,13 @@ class SpreadAnalyzer:
         warmup_samples: int = 100,
         long_threshold: Decimal = Decimal("10"),
         short_threshold: Decimal = Decimal("10"),
+        min_spread: Decimal = Decimal("0"),
         window_size: int = 500,
     ):
         self.warmup_samples = warmup_samples
         self.long_threshold = long_threshold
         self.short_threshold = short_threshold
+        self.min_spread = min_spread
 
         # 价差历史 (滑动窗口)
         self._long_history: deque = deque(maxlen=window_size)
@@ -99,6 +101,7 @@ class SpreadAnalyzer:
             self._last_diff_long is not None
             and self._avg_long is not None
             and self._last_diff_long > self._avg_long + self.long_threshold
+            and self._last_diff_long >= self.min_spread
         ):
             return "long_01", self._last_diff_long
 
@@ -106,6 +109,7 @@ class SpreadAnalyzer:
             self._last_diff_short is not None
             and self._avg_short is not None
             and self._last_diff_short > self._avg_short + self.short_threshold
+            and self._last_diff_short >= self.min_spread
         ):
             return "short_01", self._last_diff_short
 

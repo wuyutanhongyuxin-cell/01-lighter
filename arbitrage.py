@@ -41,6 +41,10 @@ def parse_args():
         help="最大持仓 (单边)",
     )
     parser.add_argument(
+        "--min-spread", default=Decimal("0"), type=Decimal,
+        help="最小价差绝对值, 低于此值不交易 (默认: 0, 不限制)",
+    )
+    parser.add_argument(
         "--long-threshold", default=Decimal("10"), type=Decimal,
         help="做多阈值偏移 (默认: 10)",
     )
@@ -121,6 +125,7 @@ async def main():
         ticker=args.ticker,
         order_quantity=args.size,
         max_position=args.max_position,
+        min_spread=args.min_spread,
         long_threshold=args.long_threshold,
         short_threshold=args.short_threshold,
         fill_timeout=args.fill_timeout,

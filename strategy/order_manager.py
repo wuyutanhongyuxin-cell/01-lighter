@@ -239,12 +239,15 @@ class OrderManager:
 
     async def _wait_for_o1_fill(self, order_id: int) -> bool:
         """
-        快速轮询检测01 Maker单成交
+        等待01 Maker 单成交 (非破坏性轮询 + 超时撤单)
 
-        每 0.5 秒尝试撤单:
-          - 撤单成功 → 未成交, 返回 False
-          - ORDER_NOT_FOUND → 已成交, 立即返回 True
-        相比旧版盲等 fill_timeout 秒, 平均检测时间从 5s 降到 ~1s
+        策略:
+          1. 每 0.5s 通过 orders API 查询订单是否还在 (不撤单, 不破坏订单!)
+          2. 订单从挂单列表消失 → 已被 taker 吃掉 → 立即返回 True
+          3. 超时后才执行撤单 (唯一的破坏性操作)
+
+        相比旧版: 旧版盲等 fill_timeout 再检查一次, 本版每 0.5s 查一次
+        关键: 查询期间订单始终在订单簿上, 有足够时间被成交!
         """
         poll_interval = 0.5
         start = time.time()
@@ -254,44 +257,44 @@ class OrderManager:
             f"poll={poll_interval}s"
         )
 
-        # 先等 0.5 秒, 给订单一个成交窗口
-        await asyncio.sleep(poll_interval)
+        # 先等 1 秒, 给订单一个初始成交窗口
+        await asyncio.sleep(1.0)
 
+        # 轮询: 查询订单是否还在挂单列表 (非破坏性!)
         while time.time() - start < self.fill_timeout:
             try:
-                cancelled = await self.o1.cancel_order(self.o1_market_id, order_id)
-                if cancelled:
-                    # 撤单成功 = 未成交
+                open_orders = await self.o1._get_open_orders_from_api(self.o1_market_id)
+                if order_id not in open_orders:
+                    # 订单不在挂单列表 → 已成交! (我们没撤过它)
                     elapsed = time.time() - start
-                    logger.info(f"01 订单 #{order_id} 撤单成功 (未成交), 耗时 {elapsed:.1f}s")
-                    self.o1.order_tracker.mark_cancelled(order_id)
-                    return False
+                    logger.info(
+                        f"01 订单 #{order_id} 已成交! "
+                        f"(从挂单列表消失, 检测耗时 {elapsed:.1f}s)"
+                    )
+                    self.o1.order_tracker.mark_filled(order_id)
+                    return True
                 else:
-                    # cancel_order 返回 False = ORDER_NOT_FOUND = 已成交!
-                    elapsed = time.time() - start
-                    logger.info(f"01 订单 #{order_id} 已成交! 检测耗时 {elapsed:.1f}s")
-                    self.o1.order_tracker.mark_filled(order_id)
-                    return True
+                    logger.debug(f"01 订单 #{order_id} 仍在挂单中...")
             except Exception as e:
-                if "ORDER_NOT_FOUND" in str(e):
-                    elapsed = time.time() - start
-                    logger.info(f"01 订单 #{order_id} 已成交 (异常检测)! 耗时 {elapsed:.1f}s")
-                    self.o1.order_tracker.mark_filled(order_id)
-                    return True
-                logger.warning(f"撤单检测异常 (继续轮询): {e}")
+                # API 查询失败 → 跳过本次, 继续等
+                logger.debug(f"查询挂单状态失败 (继续等待): {e}")
 
             await asyncio.sleep(poll_interval)
 
-        # 超时: 最后一次撤单尝试
-        logger.info(f"01 订单 #{order_id} 超时 ({self.fill_timeout}s), 最后一次撤单...")
+        # 超时: 用撤单做最终判断
+        elapsed = time.time() - start
+        logger.info(f"01 订单 #{order_id} 超时 ({elapsed:.1f}s), 尝试撤单...")
         try:
             cancelled = await self.o1.cancel_order(self.o1_market_id, order_id)
-            if not cancelled:
+            if cancelled:
+                logger.info(f"01 订单 #{order_id} 撤单成功 (未成交)")
+                self.o1.order_tracker.mark_cancelled(order_id)
+                return False
+            else:
+                # ORDER_NOT_FOUND = 在超时前一刻成交了
                 logger.info(f"01 订单 #{order_id} 超时但已成交!")
                 self.o1.order_tracker.mark_filled(order_id)
                 return True
-            logger.info(f"01 订单 #{order_id} 超时撤单成功 (未成交)")
-            self.o1.order_tracker.mark_cancelled(order_id)
         except Exception as e:
             if "ORDER_NOT_FOUND" in str(e):
                 logger.info(f"01 订单 #{order_id} 超时但已成交 (异常检测)")

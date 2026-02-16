@@ -280,26 +280,56 @@ class ArbStrategy:
             )
 
     async def _check_balances(self):
-        """定期检查两端余额"""
+        """
+        定期检查两端余额
+
+        关键: API 错误不触发停机! 只有连续多次确认余额不足才停机。
+        (之前 01 API 502 → get_balance 返回 0 → 误判余额不足 → 单边平仓灾难)
+        """
         self._last_balance_check = time.time()
 
         try:
             o1_balance = await self.o1.get_balance()
+        except Exception as e:
+            logger.warning(f"01 余额查询失败 (忽略本次检查): {e}")
+            return  # API 错误 → 跳过, 不触发停机!
+
+        try:
             lighter_balance = await self.lighter.get_balance()
+        except Exception as e:
+            logger.warning(f"Lighter 余额查询失败 (忽略本次检查): {e}")
+            return  # API 错误 → 跳过, 不触发停机!
 
-            logger.debug(
-                f"余额: 01={o1_balance} USDC, Lighter={lighter_balance} USDC"
+        logger.debug(
+            f"余额: 01={o1_balance} USDC, Lighter={lighter_balance} USDC"
+        )
+
+        if o1_balance < MIN_BALANCE or lighter_balance < MIN_BALANCE:
+            # 连续确认: 再查一次, 防止单次 API 异常误判
+            logger.warning(
+                f"余额疑似不足 (01={o1_balance}, Lighter={lighter_balance}), "
+                f"等待 3 秒后重新确认..."
             )
+            await asyncio.sleep(3)
+            try:
+                o1_balance2 = await self.o1.get_balance()
+                lighter_balance2 = await self.lighter.get_balance()
+            except Exception as e:
+                logger.warning(f"二次余额确认失败 (忽略): {e}")
+                return  # 第二次也查不到 → 可能 API 有问题, 不停机
 
-            if o1_balance < MIN_BALANCE or lighter_balance < MIN_BALANCE:
+            if o1_balance2 < MIN_BALANCE or lighter_balance2 < MIN_BALANCE:
                 logger.error(
-                    f"余额不足! 01={o1_balance}, Lighter={lighter_balance} "
+                    f"余额不足已确认! 01={o1_balance2}, Lighter={lighter_balance2} "
                     f"(最低={MIN_BALANCE})"
                 )
-                self._stop_reason = f"余额不足 (01={o1_balance}, Lighter={lighter_balance})"
+                self._stop_reason = f"余额不足 (01={o1_balance2}, Lighter={lighter_balance2})"
                 self._stop_flag = True
-        except Exception as e:
-            logger.warning(f"余额检查失败: {e}")
+            else:
+                logger.info(
+                    f"余额恢复正常: 01={o1_balance2}, Lighter={lighter_balance2} "
+                    f"(首次查询可能是 API 抖动)"
+                )
 
     def _log_status(self, spread_stats: dict):
         """定期日志输出"""
@@ -440,14 +470,29 @@ class ArbStrategy:
 
         logger.info("退出完成!")
 
+    def _pick_position(self, api_pos: Decimal, local_pos: Decimal, label: str) -> Decimal:
+        """
+        选择仓位值: 取绝对值更大的那个 (安全优先)
+
+        原因: API 临时 502 时返回 0, 但本地跟踪可能有真实仓位。
+        宁可多平一笔 (reduce_only 会保护), 也不能漏平。
+        """
+        if abs(api_pos) >= abs(local_pos):
+            return api_pos
+        logger.warning(
+            f"{label} API 仓位({api_pos}) < 本地跟踪({local_pos}), "
+            f"使用本地值 (API 可能异常)"
+        )
+        return local_pos
+
     async def _close_all_positions(self):
         """
-        平仓两端所有仓位 (参考 01test2 的 _emergency_close_all + _try_close_position)
+        平仓两端所有仓位
 
-        关键改进:
-        - 查询交易所真实仓位, 不依赖本地跟踪
-        - 每次重试前重新获取订单簿价格
-        - 记录每步结果, 便于排查
+        关键安全逻辑:
+        - API 和本地跟踪取绝对值更大的 (防止 API 502 返回 0 导致漏平)
+        - reduce_only=True 保护 (实际无仓位时交易所会拒绝, 不会反向开仓)
+        - 每次重试前重新查询价格和仓位
         """
         max_retries = 3
         min_size = self.order_quantity / 10
@@ -455,29 +500,37 @@ class ArbStrategy:
         for attempt in range(max_retries):
             logger.info(f"--- 平仓尝试 {attempt + 1}/{max_retries} ---")
 
-            # 查询两端真实仓位
-            o1_pos = self.positions.o1_position
-            lighter_pos = self.positions.lighter_position
+            # 查询两端真实仓位 (API 失败时用本地值兜底)
+            local_o1 = self.positions.o1_position
+            local_lighter = self.positions.lighter_position
 
+            api_o1 = Decimal("0")
             try:
-                o1_pos = await asyncio.wait_for(
+                api_o1 = await asyncio.wait_for(
                     self.o1.get_position(self.o1_market_id), timeout=10
                 )
-                logger.info(f"01 真实仓位: {o1_pos}")
+                logger.info(f"01 API仓位: {api_o1}, 本地跟踪: {local_o1}")
             except Exception as e:
-                logger.warning(f"查询01真实仓位失败, 用本地值 {o1_pos}: {e}")
+                logger.warning(f"查询01仓位失败, 用本地值 {local_o1}: {e}")
 
+            api_lighter = Decimal("0")
             try:
-                lighter_pos = await asyncio.wait_for(
+                api_lighter = await asyncio.wait_for(
                     self.lighter.get_position(self.lighter_market_id), timeout=10
                 )
-                logger.info(f"Lighter 真实仓位: {lighter_pos}")
+                logger.info(f"Lighter API仓位: {api_lighter}, 本地跟踪: {local_lighter}")
             except Exception as e:
-                logger.warning(f"查询Lighter真实仓位失败, 用本地值 {lighter_pos}: {e}")
+                logger.warning(f"查询Lighter仓位失败, 用本地值 {local_lighter}: {e}")
+
+            # 取绝对值更大的 (防止 API 502 返回 0)
+            o1_pos = self._pick_position(api_o1, local_o1, "01")
+            lighter_pos = self._pick_position(api_lighter, local_lighter, "Lighter")
 
             if abs(o1_pos) < min_size and abs(lighter_pos) < min_size:
                 logger.info(f"两端仓位已清空 (01={o1_pos}, Lighter={lighter_pos})")
                 return
+
+            logger.info(f"待平仓: 01={o1_pos}, Lighter={lighter_pos}")
 
             # 平仓01端
             if abs(o1_pos) >= min_size:
@@ -489,7 +542,7 @@ class ArbStrategy:
                     if success:
                         logger.info(f"01 平仓指令提交成功: 平 {o1_pos}")
                     else:
-                        logger.error(f"01 平仓指令提交返回失败")
+                        logger.error("01 平仓指令提交返回失败")
                 except asyncio.TimeoutError:
                     logger.error("01 平仓超时 (15s)")
                 except Exception as e:
@@ -520,6 +573,10 @@ class ArbStrategy:
             final_lighter = await asyncio.wait_for(
                 self.lighter.get_position(self.lighter_market_id), timeout=10
             )
+            # 再次和本地跟踪对比
+            final_o1 = self._pick_position(final_o1, self.positions.o1_position, "01(最终)")
+            final_lighter = self._pick_position(final_lighter, self.positions.lighter_position, "Lighter(最终)")
+
             if abs(final_o1) >= min_size or abs(final_lighter) >= min_size:
                 logger.error(
                     f"!!! 平仓未完全成功 !!! 01={final_o1}, Lighter={final_lighter} "
@@ -532,7 +589,20 @@ class ArbStrategy:
             else:
                 logger.info(f"最终确认: 两端仓位已清空 (01={final_o1}, Lighter={final_lighter})")
         except Exception as e:
-            logger.error(f"最终仓位确认失败: {e}, 请手动检查!")
+            # 最终确认失败时, 检查本地跟踪
+            local_o1 = self.positions.o1_position
+            local_lighter = self.positions.lighter_position
+            if abs(local_o1) >= min_size or abs(local_lighter) >= min_size:
+                logger.error(
+                    f"最终确认失败且本地跟踪有仓位: 01={local_o1}, Lighter={local_lighter}, "
+                    f"请手动检查! 错误: {e}"
+                )
+                if self.tg:
+                    await self.tg.send_message(
+                        f"⚠️ *平仓确认失败*\n本地跟踪: 01={local_o1} Lighter={local_lighter}\n请手动检查!"
+                    )
+            else:
+                logger.warning(f"最终仓位确认API失败, 但本地跟踪已清空: {e}")
 
     def request_stop(self, reason: str = "用户中断"):
         """请求停止 (由信号处理器调用)"""

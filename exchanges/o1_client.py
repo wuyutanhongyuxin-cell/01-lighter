@@ -596,55 +596,66 @@ class O1ExchangeClient(BaseExchangeClient):
     # ========== 仓位与余额 ==========
 
     async def _get_account_data(self) -> Optional[Dict]:
-        """获取完整账户数据 — GET /account/{account_id}"""
+        """
+        获取完整账户数据 — GET /account/{account_id}
+
+        Raises:
+            RuntimeError: API 返回非 200 或网络异常 (不再静默返回 None!)
+        """
         if self._account_id is None:
-            return None
+            raise RuntimeError("01 account_id 未初始化")
 
-        try:
-            url = f"{self.api_url}/account/{self._account_id}"
-            async with self._http_session.get(url) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                else:
-                    logger.debug(f"获取01账户数据失败: {resp.status}")
-        except Exception as e:
-            logger.debug(f"获取01账户数据异常: {e}")
-
-        return None
+        url = f"{self.api_url}/account/{self._account_id}"
+        async with self._http_session.get(
+            url, timeout=aiohttp.ClientTimeout(total=10)
+        ) as resp:
+            if resp.status == 200:
+                return await resp.json()
+            else:
+                raise RuntimeError(f"01 获取账户数据失败: HTTP {resp.status}")
 
     async def get_position(self, market_id) -> Decimal:
-        """获取持仓 — 从 GET /account/{account_id} 提取"""
+        """
+        获取持仓 — 从 GET /account/{account_id} 提取
+
+        Raises:
+            RuntimeError: API 不可用时抛出异常 (不再静默返回 0!)
+        """
         if isinstance(market_id, str):
             market_id = self.get_market_id(market_id)
 
         data = await self._get_account_data()
-        if data:
-            positions = data.get("positions", [])
-            for pos in positions:
-                pos_market = pos.get("marketId", pos.get("market_id", -1))
-                if int(pos_market) == market_id:
-                    # 仓位数据已是人类可读格式
-                    size = pos.get("size", pos.get("netSize", 0))
-                    return Decimal(str(size))
+        positions = data.get("positions", [])
+        for pos in positions:
+            pos_market = pos.get("marketId", pos.get("market_id", -1))
+            if int(pos_market) == market_id:
+                # 仓位数据已是人类可读格式
+                size = pos.get("size", pos.get("netSize", 0))
+                return Decimal(str(size))
 
         return Decimal("0")
 
     async def get_balance(self) -> Decimal:
-        """获取 USDC 余额 — 从 GET /account/{account_id} 提取"""
-        data = await self._get_account_data()
-        if data:
-            # 从 balances 数组提取
-            balances = data.get("balances", [])
-            for bal in balances:
-                if bal.get("tokenId", 0) == 0:  # USDC tokenId=0
-                    return Decimal(str(bal.get("balance", bal.get("amount", 0))))
+        """
+        获取 USDC 余额 — 从 GET /account/{account_id} 提取
 
-            # 或者从 margins 提取
-            margins = data.get("margins", {})
-            if margins:
-                equity = margins.get("equity", margins.get("accountValue", 0))
-                if equity:
-                    return Decimal(str(equity))
+        Raises:
+            RuntimeError: API 不可用时抛出异常 (不再静默返回 0!)
+        """
+        data = await self._get_account_data()
+
+        # 从 balances 数组提取
+        balances = data.get("balances", [])
+        for bal in balances:
+            if bal.get("tokenId", 0) == 0:  # USDC tokenId=0
+                return Decimal(str(bal.get("balance", bal.get("amount", 0))))
+
+        # 或者从 margins 提取
+        margins = data.get("margins", {})
+        if margins:
+            equity = margins.get("equity", margins.get("accountValue", 0))
+            if equity:
+                return Decimal(str(equity))
 
         return Decimal("0")
 

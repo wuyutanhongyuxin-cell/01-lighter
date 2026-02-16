@@ -231,6 +231,24 @@ class ArbStrategy:
             logger.error("风险超限, 暂停交易")
             return
 
+        # 7.5 仓位发散保护: 两端净仓位应接近 0 (一端多一端空)
+        net_pos = abs(self.positions.o1_position + self.positions.lighter_position)
+        if net_pos > self.order_quantity * 3:
+            logger.error(
+                f"仓位发散过大! net={net_pos} "
+                f"(01={self.positions.o1_position}, "
+                f"Lighter={self.positions.lighter_position}), 紧急停机!"
+            )
+            self.request_stop(f"仓位发散 net={net_pos}")
+            if self.tg:
+                await self.tg.send_message(
+                    f"🚨 *仓位发散紧急停机*\n"
+                    f"净仓位: {net_pos}\n"
+                    f"01: {self.positions.o1_position}\n"
+                    f"Lighter: {self.positions.lighter_position}"
+                )
+            return
+
         # 8. 检测套利信号
         if signal and not self.order_mgr.is_busy:
             await self._handle_signal(signal, o1_bid, o1_ask, lighter_bid, lighter_ask)

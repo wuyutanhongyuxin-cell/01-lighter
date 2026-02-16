@@ -12,7 +12,7 @@ import asyncio
 import logging
 import time
 from decimal import Decimal
-from typing import Optional, Tuple
+from typing import Optional
 
 from exchanges.o1_client import O1ExchangeClient
 from exchanges.lighter_client import LighterClient
@@ -157,13 +157,21 @@ class OrderManager:
         logger.info(f"01 订单 #{order_id} 已成交! 立即对冲...")
 
         # ===== Phase 3: Lighter Taker 对冲 =====
+        # 记录对冲时的 Lighter BBO (用于估算实际成交价)
+        hedge_bbo = self.lighter.get_ws_bbo(self.lighter_market_id)
+        if hedge_bbo:
+            logger.info(
+                f"对冲时 Lighter BBO: bid={hedge_bbo['best_bid']} "
+                f"ask={hedge_bbo['best_ask']}"
+            )
+
         try:
             lighter_result = await self.lighter.place_taker_order(
                 market_id=self.lighter_market_id,
                 side=lighter_side,
                 size=self.order_quantity,
             )
-            lighter_price = lighter_result["price"]
+            lighter_submitted_price = lighter_result["price"]
         except Exception as e:
             logger.error(
                 f"Lighter 对冲失败! {e} | "
@@ -174,14 +182,29 @@ class OrderManager:
             self.positions.update_o1(o1_side, self.order_quantity)
             return None
 
+        # ===== 估算实际成交价 =====
+        # IOC 单在有流动性时成交在 best_bid/ask, 而非提交的限价 (bid×0.998)
+        if hedge_bbo:
+            if lighter_side == "sell":
+                estimated_fill_price = hedge_bbo["best_bid"]
+            else:
+                estimated_fill_price = hedge_bbo["best_ask"]
+        else:
+            estimated_fill_price = lighter_submitted_price
+
+        logger.info(
+            f"Lighter 提交限价={lighter_submitted_price}, "
+            f"估算成交价={estimated_fill_price}"
+        )
+
         # ===== 成功: 更新仓位和日志 =====
         self.positions.record_arb_trade(direction, self.order_quantity)
 
-        # 计算捕获的价差
+        # 用估算成交价计算真实价差 (而非提交限价)
         if direction == "long_01":
-            spread = lighter_price - o1_price
+            spread = estimated_fill_price - o1_price
         else:
-            spread = o1_price - lighter_price
+            spread = o1_price - estimated_fill_price
 
         self.data_logger.log_trade(
             direction=direction,
@@ -189,7 +212,7 @@ class OrderManager:
             o1_price=o1_price,
             o1_size=self.order_quantity,
             lighter_side=lighter_side,
-            lighter_price=lighter_price,
+            lighter_price=estimated_fill_price,
             lighter_size=self.order_quantity,
             spread_captured=spread,
             o1_position=self.positions.o1_position,
@@ -198,14 +221,16 @@ class OrderManager:
 
         logger.info(
             f"=== 套利完成: {direction} | 价差={spread} | "
-            f"01={o1_side}@{o1_price} Lighter={lighter_side}@{lighter_price} ==="
+            f"01={o1_side}@{o1_price} "
+            f"Lighter={lighter_side}@{estimated_fill_price} "
+            f"(限价={lighter_submitted_price}) ==="
         )
         return {
             "direction": direction,
             "o1_side": o1_side,
             "o1_price": o1_price,
             "lighter_side": lighter_side,
-            "lighter_price": lighter_price,
+            "lighter_price": estimated_fill_price,
             "size": self.order_quantity,
             "spread": spread,
             "o1_position": self.positions.o1_position,
@@ -214,46 +239,63 @@ class OrderManager:
 
     async def _wait_for_o1_fill(self, order_id: int) -> bool:
         """
-        等待01 Maker 单成交
+        快速轮询检测01 Maker单成交
 
-        由于01没有 WebSocket 推送, 使用以下策略:
-          1. 等待 fill_timeout 秒
-          2. 尝试撤单:
-             - 撤单成功 → 未成交
-             - ORDER_NOT_FOUND → 已成交
+        每 0.5 秒尝试撤单:
+          - 撤单成功 → 未成交, 返回 False
+          - ORDER_NOT_FOUND → 已成交, 立即返回 True
+        相比旧版盲等 fill_timeout 秒, 平均检测时间从 5s 降到 ~1s
         """
+        poll_interval = 0.5
+        start = time.time()
+
         logger.debug(
-            f"等待01成交: order_id={order_id}, timeout={self.fill_timeout}s"
+            f"等待01成交: order_id={order_id}, timeout={self.fill_timeout}s, "
+            f"poll={poll_interval}s"
         )
 
-        # 等待一段时间让订单有机会被成交
-        start = time.time()
-        poll_interval = 0.5
+        # 先等 0.5 秒, 给订单一个成交窗口
+        await asyncio.sleep(poll_interval)
 
         while time.time() - start < self.fill_timeout:
+            try:
+                cancelled = await self.o1.cancel_order(self.o1_market_id, order_id)
+                if cancelled:
+                    # 撤单成功 = 未成交
+                    elapsed = time.time() - start
+                    logger.info(f"01 订单 #{order_id} 撤单成功 (未成交), 耗时 {elapsed:.1f}s")
+                    self.o1.order_tracker.mark_cancelled(order_id)
+                    return False
+                else:
+                    # cancel_order 返回 False = ORDER_NOT_FOUND = 已成交!
+                    elapsed = time.time() - start
+                    logger.info(f"01 订单 #{order_id} 已成交! 检测耗时 {elapsed:.1f}s")
+                    self.o1.order_tracker.mark_filled(order_id)
+                    return True
+            except Exception as e:
+                if "ORDER_NOT_FOUND" in str(e):
+                    elapsed = time.time() - start
+                    logger.info(f"01 订单 #{order_id} 已成交 (异常检测)! 耗时 {elapsed:.1f}s")
+                    self.o1.order_tracker.mark_filled(order_id)
+                    return True
+                logger.warning(f"撤单检测异常 (继续轮询): {e}")
+
             await asyncio.sleep(poll_interval)
 
-        # 时间到, 尝试撤单来判断成交状态
+        # 超时: 最后一次撤单尝试
+        logger.info(f"01 订单 #{order_id} 超时 ({self.fill_timeout}s), 最后一次撤单...")
         try:
             cancelled = await self.o1.cancel_order(self.o1_market_id, order_id)
-
-            if cancelled:
-                # 撤单成功 = 未成交
-                self.o1.order_tracker.mark_cancelled(order_id)
-                return False
-            else:
-                # ORDER_NOT_FOUND = 已成交
+            if not cancelled:
+                logger.info(f"01 订单 #{order_id} 超时但已成交!")
                 self.o1.order_tracker.mark_filled(order_id)
                 return True
+            logger.info(f"01 订单 #{order_id} 超时撤单成功 (未成交)")
+            self.o1.order_tracker.mark_cancelled(order_id)
         except Exception as e:
             if "ORDER_NOT_FOUND" in str(e):
+                logger.info(f"01 订单 #{order_id} 超时但已成交 (异常检测)")
                 self.o1.order_tracker.mark_filled(order_id)
                 return True
-            logger.error(f"检测01成交状态异常: {e}")
-            # 保守处理: 尝试撤单
-            try:
-                await self.o1.cancel_order(self.o1_market_id, order_id)
-                self.o1.order_tracker.mark_cancelled(order_id)
-            except Exception:
-                pass
-            return False
+            logger.error(f"超时撤单异常: {e}")
+        return False

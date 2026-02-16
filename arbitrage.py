@@ -53,8 +53,8 @@ def parse_args():
         help="做空阈值偏移 (默认: 10)",
     )
     parser.add_argument(
-        "--fill-timeout", default=5, type=int,
-        help="Maker 单超时秒数 (默认: 5)",
+        "--fill-timeout", default=3, type=int,
+        help="Maker 单超时秒数 (默认: 3, 轮询撤单下已足够)",
     )
     parser.add_argument(
         "--warmup-samples", default=100, type=int,

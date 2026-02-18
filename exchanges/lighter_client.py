@@ -62,6 +62,11 @@ class LighterClient(BaseExchangeClient):
         self._account_state: Dict = {}
         self._account_ready = asyncio.Event()
 
+        # WS 活跃度跟踪 (检测假死)
+        self._last_ws_ob_update: float = 0  # 上次订单簿更新时间
+        self._last_ws_account_update: float = 0  # 上次账户更新时间
+        self._ws_stale_threshold: float = 30  # 超过30秒无更新 = 假死
+
         # 订单索引计数器 (client_order_index 必须全局唯一)
         self._order_counter = int(time.time() * 1000) % 1_000_000
 
@@ -163,6 +168,7 @@ class LighterClient(BaseExchangeClient):
         """WsClient 订单簿更新回调"""
         mid = int(market_id) if isinstance(market_id, str) else market_id
         self._orderbooks[mid] = order_book
+        self._last_ws_ob_update = time.time()
         if not self._orderbook_ready.is_set():
             self._orderbook_ready.set()
             logger.info(f"Lighter 订单簿就绪 (market={mid})")
@@ -170,9 +176,9 @@ class LighterClient(BaseExchangeClient):
     def _on_account_update(self, account_id, account):
         """WsClient 账户更新回调"""
         self._account_state = account
+        self._last_ws_account_update = time.time()
         if not self._account_ready.is_set():
             self._account_ready.set()
-            # 首次收到账户数据时，输出键名用于调试
             if isinstance(account, dict):
                 logger.info(
                     f"Lighter 账户状态就绪 (account={account_id}), "
@@ -184,30 +190,101 @@ class LighterClient(BaseExchangeClient):
                     f"type={type(account).__name__}"
                 )
 
+    def is_ws_stale(self) -> bool:
+        """检测 WS 是否假死 (超过阈值未收到任何更新)"""
+        if self._last_ws_ob_update == 0:
+            return False  # 还没收到过数据, 不算假死
+        age = time.time() - self._last_ws_ob_update
+        return age > self._ws_stale_threshold
+
+    def get_ws_age(self) -> float:
+        """获取 WS 数据年龄 (秒)"""
+        if self._last_ws_ob_update == 0:
+            return 0
+        return time.time() - self._last_ws_ob_update
+
+    async def _force_ws_reconnect(self, reason: str):
+        """强制断开并重建 WS 连接 (解决假死问题)"""
+        logger.warning(f"强制重连 Lighter WS: {reason}")
+        try:
+            if self.ws_client and self.ws_client.ws:
+                await self.ws_client.ws.close()
+        except Exception as e:
+            logger.debug(f"关闭旧 WS 异常 (忽略): {e}")
+
     async def start_websocket(self, market_indices: List[int]):
-        """启动 WebSocket 订阅 (在后台运行)"""
-        self.ws_client = lighter.WsClient(
-            order_book_ids=market_indices,
-            account_ids=[self.account_index],
-            on_order_book_update=self._on_order_book_update,
-            on_account_update=self._on_account_update,
-        )
+        """启动 WebSocket 订阅 (在后台运行, 含假死检测)"""
+        self._ws_market_indices = market_indices
+
+        def _create_ws_client():
+            return lighter.WsClient(
+                order_book_ids=market_indices,
+                account_ids=[self.account_index],
+                on_order_book_update=self._on_order_book_update,
+                on_account_update=self._on_account_update,
+            )
+
+        self.ws_client = _create_ws_client()
 
         async def _ws_loop():
-            """WebSocket 主循环, 带重连"""
+            """WebSocket 主循环, 带重连 + 假死检测"""
             while True:
                 try:
                     logger.info("Lighter WebSocket 连接中...")
-                    await self.ws_client.run_async()
+
+                    # 用 asyncio.wait 同时监控 WS 和假死
+                    ws_task = asyncio.ensure_future(self.ws_client.run_async())
+                    stale_checker = asyncio.ensure_future(self._ws_stale_watchdog())
+
+                    done, pending = await asyncio.wait(
+                        [ws_task, stale_checker],
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+
+                    # 取消剩余任务
+                    for task in pending:
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+
+                    # 检查是谁先完成的
+                    for task in done:
+                        exc = task.exception() if not task.cancelled() else None
+                        if exc and not isinstance(exc, asyncio.CancelledError):
+                            logger.warning(f"Lighter WS 异常退出: {exc}")
+
                 except asyncio.CancelledError:
                     logger.info("Lighter WebSocket 已取消")
                     break
                 except Exception as e:
-                    logger.warning(f"Lighter WebSocket 断开: {e}, 3秒后重连...")
-                    await asyncio.sleep(3)
+                    logger.warning(f"Lighter WebSocket 断开: {e}")
+
+                # 重连前创建新的 WS 客户端
+                logger.info("3 秒后重连 Lighter WS...")
+                await asyncio.sleep(3)
+                self.ws_client = _create_ws_client()
 
         self._ws_task = asyncio.create_task(_ws_loop())
         logger.info(f"Lighter WebSocket 已启动, 订阅市场: {market_indices}")
+
+    async def _ws_stale_watchdog(self):
+        """假死看门狗: 超过阈值没收到数据就触发重连"""
+        # 等 WS 先连上
+        await asyncio.sleep(self._ws_stale_threshold)
+
+        while True:
+            await asyncio.sleep(5)  # 每 5 秒检查一次
+            if self._last_ws_ob_update > 0:
+                age = time.time() - self._last_ws_ob_update
+                if age > self._ws_stale_threshold:
+                    logger.error(
+                        f"Lighter WS 假死! 最后更新在 {age:.0f}s 前, "
+                        f"触发重连..."
+                    )
+                    await self._force_ws_reconnect(f"假死 {age:.0f}s")
+                    return  # 退出看门狗, 让 _ws_loop 重连
 
     async def wait_for_orderbook(self, timeout: float = 30):
         """等待订单簿数据就绪"""
@@ -462,14 +539,20 @@ class LighterClient(BaseExchangeClient):
     # ========== 仓位与余额 ==========
 
     async def get_position(self, market_id) -> Decimal:
-        """获取持仓"""
+        """
+        获取持仓
+
+        Raises:
+            RuntimeError: WS 假死且 REST 也失败时抛异常 (不返回 0!)
+        """
         if isinstance(market_id, str):
             market_id = self.get_market_index(market_id)
 
-        # 优先从 WebSocket 账户状态获取 (raw dict)
-        if self._account_state:
+        ws_stale = self.is_ws_stale()
+
+        # 优先从 WebSocket 账户状态获取 (仅当 WS 不假死时)
+        if self._account_state and not ws_stale:
             positions = self._account_state.get("positions", {})
-            # positions 可能是 dict (keyed by market) 或 list
             if isinstance(positions, dict):
                 for key, pos in positions.items():
                     pos_market = pos.get("market_id", key)
@@ -485,8 +568,10 @@ class LighterClient(BaseExchangeClient):
                         sign = int(pos.get("sign", 1))
                         return position if sign >= 0 else -position
 
-        # fallback: REST API
-        # account() 返回 DetailedAccounts, 需要 .accounts[0]
+        if ws_stale:
+            logger.warning(f"Lighter WS 假死 ({self.get_ws_age():.0f}s), 使用 REST 查仓位")
+
+        # REST API fallback (WS 假死或 WS 无数据时)
         try:
             account_api = lighter.AccountApi(self.api_client)
             result = await account_api.account(
@@ -500,21 +585,31 @@ class LighterClient(BaseExchangeClient):
                             position = Decimal(str(pos.position))
                             sign = int(pos.sign) if hasattr(pos, "sign") else 1
                             return position if sign >= 0 else -position
+            return Decimal("0")  # REST 成功但无仓位 = 真的没仓位
         except Exception as e:
-            logger.debug(f"Lighter 获取仓位失败: {e}")
+            if ws_stale:
+                raise RuntimeError(
+                    f"Lighter 仓位查询失败: WS 假死 + REST 异常: {e}"
+                )
+            logger.debug(f"Lighter REST 获取仓位失败 (WS 有数据): {e}")
 
         return Decimal("0")
 
     async def get_balance(self) -> Decimal:
-        """获取 USDC 余额"""
-        # 从 WebSocket 账户状态 (raw dict)
-        if self._account_state:
-            # 尝试 available_balance / collateral
+        """
+        获取 USDC 余额
+
+        Raises:
+            RuntimeError: WS 假死且 REST 也失败时抛异常 (不返回 0!)
+        """
+        ws_stale = self.is_ws_stale()
+
+        # 从 WebSocket 账户状态 (仅当 WS 不假死时)
+        if self._account_state and not ws_stale:
             for key in ("available_balance", "collateral"):
                 val = self._account_state.get(key)
                 if val and str(val) != "0":
                     return Decimal(str(val))
-            # 尝试 assets 中的 USDC
             assets = self._account_state.get("assets", {})
             if isinstance(assets, dict):
                 usdc = assets.get("USDC", {})
@@ -522,8 +617,10 @@ class LighterClient(BaseExchangeClient):
                 if balance and str(balance) != "0":
                     return Decimal(str(balance))
 
-        # fallback: REST API
-        # account() 返回 DetailedAccounts, 需要 .accounts[0]
+        if ws_stale:
+            logger.warning(f"Lighter WS 假死 ({self.get_ws_age():.0f}s), 使用 REST 查余额")
+
+        # REST API fallback
         try:
             account_api = lighter.AccountApi(self.api_client)
             result = await account_api.account(
@@ -531,23 +628,24 @@ class LighterClient(BaseExchangeClient):
             )
             if hasattr(result, "accounts") and result.accounts:
                 acct = result.accounts[0]
-                # 优先用 available_balance
                 if hasattr(acct, "available_balance") and acct.available_balance:
                     val = Decimal(str(acct.available_balance))
                     if val > 0:
                         return val
-                # 次选 collateral
                 if hasattr(acct, "collateral") and acct.collateral:
                     val = Decimal(str(acct.collateral))
                     if val > 0:
                         return val
-                # 最后从 assets 数组中查找 USDC
                 if hasattr(acct, "assets"):
                     for asset in acct.assets:
                         if hasattr(asset, "symbol") and asset.symbol == "USDC":
                             return Decimal(str(asset.balance))
         except Exception as e:
-            logger.warning(f"Lighter 获取余额失败: {e}")
+            if ws_stale:
+                raise RuntimeError(
+                    f"Lighter 余额查询失败: WS 假死 + REST 异常: {e}"
+                )
+            logger.warning(f"Lighter REST 获取余额失败 (WS 有数据): {e}")
 
         return Decimal("0")
 

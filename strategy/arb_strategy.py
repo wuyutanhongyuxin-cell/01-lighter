@@ -174,6 +174,16 @@ class ArbStrategy:
 
     async def _main_loop_iteration(self, loop_count: int):
         """主循环单次迭代"""
+        # 0. 检测 Lighter WS 假死
+        if self.lighter.is_ws_stale():
+            ws_age = self.lighter.get_ws_age()
+            if loop_count % 10 == 0:
+                logger.warning(
+                    f"Lighter WS 假死! 最后更新 {ws_age:.0f}s 前, "
+                    f"暂停交易 (等待自动重连)"
+                )
+            return
+
         # 1. 刷新两端订单簿
         ready = await self.ob_manager.refresh_all()
         if not ready:
